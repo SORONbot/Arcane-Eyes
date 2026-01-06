@@ -1,5 +1,6 @@
 import ipaddress
 import os
+import subprocess
 import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +10,7 @@ from PyQt6.QtCore import *
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
 from PyQt6.QtWidgets import *
 
+from custom_ui_elements import RecordDialog
 from utils import check_camera, CameraScanner
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
@@ -83,7 +85,7 @@ class WorkerSignals(QObject):
 
     finished = pyqtSignal()
     error = pyqtSignal(tuple)
-    result = pyqtSignal(object)
+    result = pyqtSignal(object, bool)
     stop = pyqtSignal()
 
 
@@ -129,9 +131,38 @@ class CameraWorker(QRunnable):
         self.signals = WorkerSignals()
         self.stop_flag = False
 
+        # Recording attributes
+        self.recording_process = None
+        self.recording_writer = None
+        self.recording_stop_time = None
+        self.record_filename = None
+
         self.kwargs['stop_callback'] = self.signals.stop
 
         self.signals.stop.connect(self.stop_worker)
+
+    def start_recording(self, full_path, duration_mins):
+        # Duration in seconds
+        seconds = duration_mins * 60
+
+        # This command captures video AND audio directly to the file
+        command = [
+            'ffmpeg',
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-rtsp_transport', 'tcp',  # <--- Use TCP for the file save
+            '-y',
+            '-i', str(self.address),
+            '-t', str(seconds),
+            '-map', '0',
+            '-c:v', 'copy',  # Stream copy for 0% CPU usage
+            '-c:a', 'aac',
+            str(full_path)
+        ]
+
+        # Run in background
+        print(f"FFmpeg started recording for {self.address}")
+        self.recording_process = subprocess.Popen(command)
 
     def stop_worker(self):
         self.stop_flag = True  # Set the flag to stop the worker
@@ -139,34 +170,50 @@ class CameraWorker(QRunnable):
     @pyqtSlot()
     def run(self):
         try:
-            # Get the stream from the camera
             camera_stream = cv2.VideoCapture(self.address)
+            actual_fps = camera_stream.get(cv2.CAP_PROP_FPS)
+            if actual_fps == 0: actual_fps = 20.0
 
             while not self.stop_flag:
-                # Read the stream
-                is_frame_from_camera_ok, cam_img_res = camera_stream.read()
+                is_ok, cam_img_res = camera_stream.read()
 
-                if is_frame_from_camera_ok:
-                    # Get the Height and Width of the frame
-                    cam_original_height, cam_original_width = cam_img_res.shape[:2]
+                is_recording = False
+                if getattr(self, 'recording_process', None) is not None:
+                    if self.recording_process.poll() is None:
+                        is_recording = True
+                    else:
+                        # The FFmpeg process finished on its own
+                        print(f"FFmpeg finished for {self.address}")
+                        self.recording_process = None
 
-                    # Call the function to resize the frame but keep aspect ratio
-                    frame = resize_and_maintain_aspect_ratio(cam_original_width, cam_original_height, cam_img_res)
+                if is_ok:
+                    # 1. Handle Recording Logic
+                    from time import time
+                    if self.recording_stop_time and time() < self.recording_stop_time:
+                        if self.recording_writer is None:
+                            h, w = cam_img_res.shape[:2]
+                            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+                            self.recording_writer = cv2.VideoWriter(self.record_filename, fourcc, actual_fps, (w, h))
 
-                    # Emit the result signal with the resized frame
-                    self.signals.result.emit(frame)
+                        self.recording_writer.write(cam_img_res)
+                    elif self.recording_writer:
+                        # Time is up or not recording
+                        self.recording_writer.release()
+                        self.recording_writer = None
+                        self.recording_stop_time = None
+                        print(f"Recording finished for {self.address}")
+
+                    # 2. Handle UI Logic
+                    frame = resize_and_maintain_aspect_ratio(cam_img_res.shape[1], cam_img_res.shape[0], cam_img_res)
+                    self.signals.result.emit(frame, is_recording)
                 else:
-                    print("Failed to capture image")
-                    traceback.print_exc()
-                    exctype, value = sys.exc_info()[:2]
-                    self.signals.error.emit((exctype, value, traceback.format_exc()))
+                    break
 
+            if self.recording_writer:
+                self.recording_writer.release()
             camera_stream.release()
-        except Exception as e:
-            print("Error occurred in worker")
+        except Exception:
             traceback.print_exc()
-            exctype, value = sys.exc_info()[:2]
-            self.signals.error.emit((exctype, value, traceback.format_exc()))
 
 
 class MainWindow(QMainWindow):
@@ -213,32 +260,68 @@ class MainWindow(QMainWindow):
 
         self.active_ips.add(ip)
 
-        rtsp_url = f"rtsp://{ip}:554"
+        # Container Widget
+        container = QWidget()
+        v_layout = QVBoxLayout(container)
 
-        # 1. Create a Label for the video
+        # Video Label
         video_label = QLabel(f"Connecting to {ip}...")
         video_label.setFixedSize(width, height)
         video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         video_label.setStyleSheet("background: black; color: white; border: 2px solid #333;")
 
-        # 2. Add to Grid (3 columns wide)
-        row = self.cam_count // 3
-        col = self.cam_count % 3
-        self.layout.addWidget(video_label, row, col)
+        # Record Button
+        record_button = QPushButton("Record")
+        record_button.clicked.connect(lambda: self.handle_record_request(ip))
+
+        v_layout.addWidget(video_label)
+        v_layout.addWidget(record_button)
+
+        # Container Grid
+        row, col = divmod(self.cam_count, 3)
+        self.layout.addWidget(container, row, col)
         self.cam_count += 1
 
-        # 3. Start the CameraStreamWorker (the one that does OpenCV)
+        # Start stream
+        rtsp_url = f"rtsp://{ip}:554"
         stream_worker = CameraWorker(rtsp_url)
-        # Pass the specific video_label using a lambda so the worker knows where to draw
+        stream_worker.ip = ip
+
         stream_worker.signals.result.connect(
-            lambda frame, lbl=video_label: self.update_frame(frame, lbl)
+            lambda frame, rec, lbl=video_label, btn=record_button:
+            self.update_frame(frame, lbl, rec, btn)
         )
 
         self.thread_pool.start(stream_worker)
         self.camera_workers.append(stream_worker)
 
-    def update_frame(self, frame, label):
+    def handle_record_request(self, ip):
+        dlg = RecordDialog(ip, self)  # Pass self as parent, then ip
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            full_path, duration, start_time = dlg.get_values()
+
+            # Find the worker associated with this IP
+            for worker in self.camera_workers:
+                if hasattr(worker, 'ip') and worker.ip == ip:
+                    worker.start_recording(full_path, duration)
+                    break
+
+    def update_frame(self, frame, label, is_recording, button):
         """Converts CV frame to Qt and updates the specific label passed in."""
+        if is_recording:
+            # Overlay on Video
+            cv2.circle(frame, (30, 30), 10, (0, 0, 255), -1)
+
+            # Update Button UI
+            button.setText("⏹ Recording...")
+            button.setStyleSheet("background-color: #990000; color: white; font-weight: bold;")
+            button.setEnabled(False)  # Prevent clicking while already recording
+        else:
+            # Reset Button UI
+            button.setText("Record")
+            button.setStyleSheet("")  # Resets to default
+            button.setEnabled(True)
+
         qt_img = convert_cv_to_qt(frame)
         label.setPixmap(QPixmap.fromImage(qt_img))
 
