@@ -2,5 +2,3 @@ opencv-python~=4.10.0.84
 imutils~=0.5.4
 QDarkStyle~=3.2.3
 PyQt6~=6.7.1
-
-#ss

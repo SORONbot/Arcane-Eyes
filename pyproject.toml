@@ -1,0 +1,11 @@
+[project]
+name = "ip-camera-stream-listener"
+version = "0.1.0"
+description = "ip-camera-stream-listener"
+requires-python = ">=3.12"
+dependencies = [
+    "imutils==0.5.4",
+    "opencv-python==4.12.0.88",
+    "pyqt6==6.10.1",
+    "qdarkstyle==3.2.3",
+]

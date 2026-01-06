@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="Black">
-    <option name="sdkName" value="Python 3.12 (IP_Camera_Stream_Listener)" />
+    <option name="sdkName" value="Python 3.12 (IPCameraManager)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.12 (IP_Camera_Stream_Listener)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.12 (IPCameraManager)" project-jdk-type="Python SDK" />
 </project>
