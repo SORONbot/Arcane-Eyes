@@ -10,7 +10,7 @@ from PyQt6.QtCore import *
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
 from PyQt6.QtWidgets import *
 
-from custom_ui_elements import RecordDialog
+from custom_ui_elements import RecordDialog, CameraDisplayWidget
 from utils import check_camera, CameraScanner
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
@@ -144,24 +144,37 @@ class CameraWorker(QRunnable):
     def start_recording(self, full_path, duration_mins):
         # Duration in seconds
         seconds = duration_mins * 60
+        ip = self.address.split('//')[-1].split(':')[0]
 
         # This command captures video AND audio directly to the file
         command = [
             'ffmpeg',
             '-hide_banner',
             '-loglevel', 'error',
-            '-rtsp_transport', 'tcp',  # <--- Use TCP for the file save
+            '-rtsp_transport', 'tcp',
             '-y',
+
+            # Input 0: The Video via RTSP
             '-i', str(self.address),
+
+            # Input 1: The Audio via RAW TCP
+            '-f', 'mulaw',
+            '-ar', '8000',
+            '-ac', '1',
+            '-i', f'tcp://{ip}:8001',
+            '-timeout', '5000000',
+
+            # Map video from input 0 and audio from input 1
             '-t', str(seconds),
-            '-map', '0',
-            '-c:v', 'copy',  # Stream copy for 0% CPU usage
-            '-c:a', 'aac',
+            '-map', '0:v',
+            '-map', '1:a',
+            '-c:v', 'copy',  # Keep video original (0% CPU)
+            '-c:a', 'aac',  # Convert raw Mu-Law to standard AAC for MP4
+            '-b:a', '64k',
             str(full_path)
         ]
 
-        # Run in background
-        print(f"FFmpeg started recording for {self.address}")
+        print(f"FFmpeg started dual-stream recording for {ip}")
         self.recording_process = subprocess.Popen(command)
 
     def stop_worker(self):
@@ -216,6 +229,26 @@ class CameraWorker(QRunnable):
             traceback.print_exc()
 
 
+def update_frame(frame, label, is_recording, button):
+    """Converts CV frame to Qt and updates the specific label passed in."""
+    if is_recording:
+        # Overlay on Video
+        cv2.circle(frame, (30, 30), 10, (0, 0, 255), -1)
+
+        # Update Button UI
+        button.setText("⏹ Recording...")
+        button.setStyleSheet("background-color: #990000; color: white; font-weight: bold;")
+        button.setEnabled(False)  # Prevent clicking while already recording
+    else:
+        # Reset Button UI
+        button.setText("Record")
+        button.setStyleSheet("")  # Resets to default
+        button.setEnabled(True)
+
+    qt_img = convert_cv_to_qt(frame)
+    label.setPixmap(QPixmap.fromImage(qt_img))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -253,43 +286,36 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def setup_new_camera(self, ip):
-        """Called every time the scanner finds a camera"""
-        if ip in self.active_ips:
-            print(f"Skipping {ip}, already active.")
-            return
-
+        if ip in self.active_ips: return
         self.active_ips.add(ip)
 
-        # Container Widget
+        # Container for Display + Controls
         container = QWidget()
         v_layout = QVBoxLayout(container)
 
-        # Video Label
-        video_label = QLabel(f"Connecting to {ip}...")
-        video_label.setFixedSize(width, height)
-        video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        video_label.setStyleSheet("background: black; color: white; border: 2px solid #333;")
+        # Use the new custom widget instead of a bare QLabel
+        display_widget = CameraDisplayWidget(ip)
 
         # Record Button
         record_button = QPushButton("Record")
         record_button.clicked.connect(lambda: self.handle_record_request(ip))
 
-        v_layout.addWidget(video_label)
+        v_layout.addWidget(display_widget)
         v_layout.addWidget(record_button)
 
-        # Container Grid
         row, col = divmod(self.cam_count, 3)
         self.layout.addWidget(container, row, col)
         self.cam_count += 1
 
-        # Start stream
+        # Start stream logic
         rtsp_url = f"rtsp://{ip}:554"
         stream_worker = CameraWorker(rtsp_url)
         stream_worker.ip = ip
 
+        # Update frame now targets display_widget.video_label
         stream_worker.signals.result.connect(
-            lambda frame, rec, lbl=video_label, btn=record_button:
-            self.update_frame(frame, lbl, rec, btn)
+            lambda frame, rec, lbl=display_widget.video_label, btn=record_button:
+            update_frame(frame, lbl, rec, btn)
         )
 
         self.thread_pool.start(stream_worker)
@@ -306,42 +332,34 @@ class MainWindow(QMainWindow):
                     worker.start_recording(full_path, duration)
                     break
 
-    def update_frame(self, frame, label, is_recording, button):
-        """Converts CV frame to Qt and updates the specific label passed in."""
-        if is_recording:
-            # Overlay on Video
-            cv2.circle(frame, (30, 30), 10, (0, 0, 255), -1)
-
-            # Update Button UI
-            button.setText("⏹ Recording...")
-            button.setStyleSheet("background-color: #990000; color: white; font-weight: bold;")
-            button.setEnabled(False)  # Prevent clicking while already recording
-        else:
-            # Reset Button UI
-            button.setText("Record")
-            button.setStyleSheet("")  # Resets to default
-            button.setEnabled(True)
-
-        qt_img = convert_cv_to_qt(frame)
-        label.setPixmap(QPixmap.fromImage(qt_img))
-
     def keyPressEvent(self, event: QKeyEvent):
         # This is more readable than checking for 81
         if event.key() == Qt.Key.Key_Q:
             self.close()
 
     def closeEvent(self, event):
-        """Handles cleanup of all dynamic workers."""
+        """Handles cleanup of all dynamic workers and PTZ motors."""
         dlg = CustomDialog(self)
         result = dlg.exec()
 
         if result == QMessageBox.StandardButton.Yes:
-            # Loop through ALL found cameras and signal them to stop
+            # 1. STOP ALL MOTORS
+            # We look through the grid layout to find our CameraDisplayWidgets
+            for i in range(self.layout.count()):
+                item = self.layout.itemAt(i)
+                if item and item.widget():
+                    # Search for the PTZ controller inside the widget container
+                    # This assumes you named the PTZ attribute 'ptz' in your display widget
+                    container = item.widget()
+                    display_widget = container.findChild(CameraDisplayWidget)
+                    if display_widget and hasattr(display_widget, 'ptz'):
+                        display_widget.ptz.stop()
+
+            # 2. STOP ALL WORKERS (Your existing logic)
             for worker in self.camera_workers:
                 if hasattr(worker.signals, 'stop'):
                     worker.signals.stop.emit()
 
-            # Wait for the thread pool to clean up before exiting
             self.thread_pool.waitForDone()
             event.accept()
         else:
