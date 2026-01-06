@@ -1,18 +1,19 @@
+import ipaddress
 import os
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 from PyQt6.QtCore import *
-from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
 from PyQt6.QtWidgets import *
 
-from utils import check_camera
+from utils import check_camera, CameraScanner
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
 
-camera_1_address = 'rtsp://192.168.100.25:554'
-camera_2_address = 'rtsp://192.168.100.24:554'
+cam_scanner = CameraScanner()
 
 width = 640
 height = 480
@@ -86,6 +87,39 @@ class WorkerSignals(QObject):
     stop = pyqtSignal()
 
 
+class ScannerSignals(QObject):
+    # Emits the IP address as soon as one is found
+    camera_found = pyqtSignal(str)
+    # Notifies when the entire network scan is done
+    finished = pyqtSignal()
+
+
+class ScanWorker(QRunnable):
+    def __init__(self, scanner_instance, network_range):
+        super().__init__()
+        self.scanner = scanner_instance
+        self.network_range = network_range
+        self.signals = ScannerSignals()
+
+    @pyqtSlot()
+    def run(self):
+        # We modify the logic slightly to emit signals during the loop
+        network = ipaddress.IPv4Network(self.network_range)
+
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            ip_list = [str(ip) for ip in network]
+            # We use executor.map just like you did
+            results = executor.map(check_camera, ip_list)
+
+            for ip, is_camera in zip(ip_list, results):
+                if is_camera:
+                    self.scanner.found_cameras.append(ip)
+                    # Tell the UI we found one!
+                    self.signals.camera_found.emit(ip)
+
+        self.signals.finished.emit()
+
+
 class CameraWorker(QRunnable):
     def __init__(self, address, *args, **kwargs):
         super(CameraWorker, self).__init__()
@@ -138,89 +172,94 @@ class CameraWorker(QRunnable):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.scanner = CameraScanner()
+        self.camera_workers = []
+        self.active_ips = set()
 
-        self.setWindowTitle("Camera Feeds")
-        self.setGeometry(100, 100, width * 2, height)
+        # UI Setup
+        self.central_widget = QWidget()
+        self.main_vbox = QVBoxLayout(self.central_widget)
 
-        layout = QHBoxLayout()
+        # Scan Button
+        self.scan_button = QPushButton("Scan for New Cameras")
+        self.scan_button.clicked.connect(self.run_background_scan)
+        self.main_vbox.addWidget(self.scan_button)
 
-        self.camera_feed_1_layout = QVBoxLayout()
-        self.camera_feed_2_layout = QVBoxLayout()
+        # UI setup for the Camera Feeds
+        self.grid_widget = QWidget()
+        self.layout = QGridLayout(self.grid_widget)
+        self.main_vbox.addWidget(self.grid_widget)
 
-        self.camera_feed_1 = QLabel(self)
-        self.camera_feed_1.setStyleSheet("background-color: black;")
-        self.camera_feed_1.setFixedSize(width, height)
-
-        self.camera_feed_2 = QLabel(self)
-        self.camera_feed_2.setStyleSheet("background-color: black;")
-        self.camera_feed_2.setFixedSize(width, height)
-
-        self.camera_feed_1_title = QLabel("Camera Feed 1", self)
-        self.camera_feed_1_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.camera_feed_1_title.setStyleSheet("font-weight: bold; color: white; background-color: gray;")
-
-        self.camera_feed_2_title = QLabel("Camera Feed 2", self)
-        self.camera_feed_2_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.camera_feed_2_title.setStyleSheet("font-weight: bold; color: white; background-color: gray;")
-
-        self.camera_feed_1_layout.addWidget(self.camera_feed_1_title)
-        self.camera_feed_1_layout.addWidget(self.camera_feed_1)
-
-        self.camera_feed_2_layout.addWidget(self.camera_feed_2_title)
-        self.camera_feed_2_layout.addWidget(self.camera_feed_2)
-
-        layout.addLayout(self.camera_feed_1_layout)
-        layout.addLayout(self.camera_feed_2_layout)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+        self.setCentralWidget(self.central_widget)
 
         self.thread_pool = QThreadPool()
-        print("Multithreading with maximum %d threads" % self.thread_pool.maxThreadCount())
+        self.cam_count = 0
 
-        # Set up the workers and connect signals to slots
+        # Run initial scan
+        self.run_background_scan()
 
-        if is_camera_available(camera_1_address):
-            self.camera_worker_1 = CameraWorker(camera_1_address)
-            self.thread_pool.start(self.camera_worker_1)
-            self.camera_worker_1.signals.result.connect(self.update_camera_feed_1)
-        else:
-            print("Camera 1 not available")
+    def run_background_scan(self):
+        # Create the worker
+        worker = ScanWorker(self.scanner, "192.168.100.0/24")
+        # Connect the signal to our UI update function
+        worker.signals.camera_found.connect(self.setup_new_camera)
+        self.thread_pool.start(worker)
 
-        if is_camera_available(camera_2_address):
-            self.camera_worker_2 = CameraWorker(camera_2_address)
-            self.thread_pool.start(self.camera_worker_2)
-            self.camera_worker_2.signals.result.connect(self.update_camera_feed_2)
-        else:
-            print("Camera 2 not available")
+    def setup_new_camera(self, ip):
+        """Called every time the scanner finds a camera"""
+        if ip in self.active_ips:
+            print(f"Skipping {ip}, already active.")
+            return
 
-    def update_camera_feed_1(self, frame):
+        self.active_ips.add(ip)
+
+        rtsp_url = f"rtsp://{ip}:554"
+
+        # 1. Create a Label for the video
+        video_label = QLabel(f"Connecting to {ip}...")
+        video_label.setFixedSize(width, height)
+        video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        video_label.setStyleSheet("background: black; color: white; border: 2px solid #333;")
+
+        # 2. Add to Grid (3 columns wide)
+        row = self.cam_count // 3
+        col = self.cam_count % 3
+        self.layout.addWidget(video_label, row, col)
+        self.cam_count += 1
+
+        # 3. Start the CameraStreamWorker (the one that does OpenCV)
+        stream_worker = CameraWorker(rtsp_url)
+        # Pass the specific video_label using a lambda so the worker knows where to draw
+        stream_worker.signals.result.connect(
+            lambda frame, lbl=video_label: self.update_frame(frame, lbl)
+        )
+
+        self.thread_pool.start(stream_worker)
+        self.camera_workers.append(stream_worker)
+
+    def update_frame(self, frame, label):
+        """Converts CV frame to Qt and updates the specific label passed in."""
         qt_img = convert_cv_to_qt(frame)
-        self.camera_feed_1.setPixmap(QPixmap.fromImage(qt_img))
+        label.setPixmap(QPixmap.fromImage(qt_img))
 
-    def update_camera_feed_2(self, frame):
-        qt_img = convert_cv_to_qt(frame)
-        self.camera_feed_2.setPixmap(QPixmap.fromImage(qt_img))
-
-    def keyPressEvent(self, event):
-        if event.key() == 81:
+    def keyPressEvent(self, event: QKeyEvent):
+        # This is more readable than checking for 81
+        if event.key() == Qt.Key.Key_Q:
             self.close()
 
     def closeEvent(self, event):
+        """Handles cleanup of all dynamic workers."""
         dlg = CustomDialog(self)
         result = dlg.exec()
 
         if result == QMessageBox.StandardButton.Yes:
-            # Signal the workers to stop
-            if hasattr(self, 'camera_worker_1'):
-                self.camera_worker_1.signals.stop.emit()
-            if hasattr(self, 'camera_worker_2'):
-                self.camera_worker_2.signals.stop.emit()
+            # Loop through ALL found cameras and signal them to stop
+            for worker in self.camera_workers:
+                if hasattr(worker.signals, 'stop'):
+                    worker.signals.stop.emit()
 
-            # Ensure threads are finished
+            # Wait for the thread pool to clean up before exiting
             self.thread_pool.waitForDone()
-
             event.accept()
         else:
             event.ignore()
