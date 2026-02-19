@@ -183,3 +183,11 @@ fabric.properties
 
 # idea folder, uncomment if you don't need it
 .idea/
+
+# other
+
+test_scripts/
+recordings/
+
+repomix-output.xml
+.eye_cache

@@ -1,12 +1,30 @@
+[build-system]
+requires = ["uv_build>=0.10.4,<0.11.0"]
+build-backend = "uv_build"
+
 [project]
-name = "ip-camera-stream-listener"
+name = "arcane-eyes"
 version = "0.1.0"
-description = "ip-camera-stream-listener"
+description = "Personal Project - IP camera stream listener and PTZ controller"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "av>=12.0.0",
     "imutils==0.5.4",
     "opencv-python==4.12.0.88",
     "pyqt6==6.10.1",
     "qdarkstyle==3.2.3",
     "onvif-zeep==0.2.12"
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-qt>=4.4.0"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arcane_eyes"]
+
+[project.scripts]
+arcane-eyes = "arcane_eyes.main:main"
