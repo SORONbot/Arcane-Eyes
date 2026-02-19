@@ -26,10 +26,14 @@ This project uses **uv** for ultra-fast dependency management and building.
     ```
 ---
 
+## Tested With the Following Cameras:
+- 2 TG1/YQC13/DF2427196 (Configured with iCam365)
+
 ## Next Steps
 
 - Proper Control Panel
 - Better layout management for multiple cameras (4+)
 - Proper Setup Sequence for New Cameras
 - Support for modifying internal configurations for cameras
+
 - PTZ support for cameras that do not use ONVIF
