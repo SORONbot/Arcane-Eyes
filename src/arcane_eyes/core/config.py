@@ -1,27 +1,34 @@
 import os
 from pathlib import Path
 
-# We go up 3 levels from /src/arcane_eyes/core to reach the project root
+# Base Path Logic
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-DEFAULT_SAVE_PATH = PROJECT_ROOT / "recordings"
-CACHE_FILE_PATH = PROJECT_ROOT / ".eye_cache"
 
-# Network Defaults
+# Storage Paths
+DEFAULT_SAVE_PATH = Path(os.getenv("SAVE_PATH", str(PROJECT_ROOT / "recordings")))
+CACHE_FILE_PATH = Path(os.getenv("CACHE_PATH", str(PROJECT_ROOT / ".eye_cache")))
+
+# Network & Transport
 DEFAULT_SCAN_RANGE = os.getenv("SCAN_RANGE", "192.168.100.0/24")
-RTSP_TRANSPORT_TYPE = "tcp"  # Standardizing on TCP for better stability
+RTSP_TRANSPORT_TYPE = os.getenv("RTSP_TRANSPORT", "tcp")
+RTSP_TIMEOUT = os.getenv("RTSP_TIMEOUT", "5000000") # microseconds
 
-# Dictionary for PyAV/FFmpeg options
+# Audio Settings
+AUDIO_PORT = int(os.getenv("AUDIO_PORT", 8001))
+AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "mulaw")
+AUDIO_SAMPLE_RATE = os.getenv("AUDIO_SAMPLE_RATE", "8000")
+AUDIO_CHANNELS = os.getenv("AUDIO_CHANNELS", "1")
+
+# --- Derived Dictionaries for Services ---
+
 RTSP_OPTIONS = {
     'rtsp_transport': RTSP_TRANSPORT_TYPE,
-    'stimeout': '5000000'  # 5-second timeout
+    'stimeout': RTSP_TIMEOUT
 }
 
-# Audio Defaults
-AUDIO_PORT = 8001
-AUDIO_FORMAT = "mulaw"
 AUDIO_OPTIONS = {
-    'ar': '8000',  # Audio sample rate (8kHz)
-    'ac': '1'      # Audio channels (1 = Mono)
+    'ar': AUDIO_SAMPLE_RATE,
+    'ac': AUDIO_CHANNELS
 }
 
 # Apply to OpenCV environment

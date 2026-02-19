@@ -9,6 +9,7 @@ description = "Personal Project - IP camera stream listener and PTZ controller"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "python-dotenv>=1.0.1",
     "av>=12.0.0",
     "imutils==0.5.4",
     "opencv-python==4.12.0.88",

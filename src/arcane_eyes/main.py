@@ -1,4 +1,9 @@
 import sys
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from PyQt6.QtCore import Qt, QThreadPool, pyqtSlot, QRunnable, QObject, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
 from PyQt6.QtWidgets import (
