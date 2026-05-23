@@ -1,11 +1,12 @@
 import sys
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from PyQt6.QtCore import Qt, QThreadPool, pyqtSlot, QRunnable, QObject, pyqtSignal
-from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
+from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QMessageBox, QDialog
@@ -37,6 +38,13 @@ from arcane_eyes.ui.add_camera_dialog import AddCameraDialog
 from arcane_eyes.ui.record_dialog import RecordDialog
 
 
+APP_ICON_PATH = Path(__file__).resolve().parents[2] / "assets" / "arcane-eye-icon.png"
+
+
+def make_app_icon() -> QIcon:
+    return QIcon(str(APP_ICON_PATH))
+
+
 class DiscoveryWorkerSignals(QObject):
     camera_found = pyqtSignal(str)
     finished = pyqtSignal()
@@ -63,6 +71,7 @@ class ArcaneEyesMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Arcane Eyes")
+        self.setWindowIcon(make_app_icon())
         self.resize(1280, 720)
 
         # Initialize Core Services & Managers using Config/Constants
@@ -327,6 +336,7 @@ class ArcaneEyesMainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setWindowIcon(make_app_icon())
     # Apply a nice dark theme (optional, since you have it in your dependencies)
     import qdarkstyle
     app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt6())
