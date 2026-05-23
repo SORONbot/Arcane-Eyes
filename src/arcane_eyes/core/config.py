@@ -7,6 +7,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 # Storage Paths
 DEFAULT_SAVE_PATH = Path(os.getenv("SAVE_PATH", str(PROJECT_ROOT / "recordings")))
 CACHE_FILE_PATH = Path(os.getenv("CACHE_PATH", str(PROJECT_ROOT / ".eye_cache")))
+SETUP_QR_CREDENTIAL_CACHE_PATH = Path(
+    os.getenv("SETUP_QR_CREDENTIAL_CACHE_PATH", str(PROJECT_ROOT / ".setup_qr_credentials"))
+)
+SETUP_QR_FERNET_KEY = os.getenv("SETUP_QR_FERNET_KEY", "")
 
 # Network & Transport
 DEFAULT_SCAN_RANGE = os.getenv("SCAN_RANGE", "192.168.100.0/24")

@@ -1,5 +1,6 @@
-from PyQt6.QtCore import QSize, Qt
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QStyle
+from PyQt6.QtCore import QPointF, QSize, Qt
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton
 
 from arcane_eyes.core.constants import WIDTH, HEIGHT, STYLE_PTZ_BTN
 from arcane_eyes.core.exceptions import PTZError
@@ -43,28 +44,58 @@ class CameraDisplayWidget(QWidget):
 
     def _create_overlay_buttons(self):
         button_size = 32
-        margin = 10
+        margin = 12
+        icon_size = 18
+
+        visible_height = min(HEIGHT, int(WIDTH * 9 / 16))
+        video_top = max(0, (HEIGHT - visible_height) // 2)
+        video_bottom = video_top + visible_height
 
         controls = [
-            (QStyle.StandardPixmap.SP_ArrowUp, (WIDTH // 2) - (button_size // 2), margin, 0, 1),
-            (QStyle.StandardPixmap.SP_ArrowDown, (WIDTH // 2) - (button_size // 2), HEIGHT - button_size - margin, 0, -1),
-            (QStyle.StandardPixmap.SP_ArrowLeft, margin, (HEIGHT // 2) - (button_size // 2), -1, 0),
-            (QStyle.StandardPixmap.SP_ArrowRight, WIDTH - button_size - margin, (HEIGHT // 2) - (button_size // 2), 1, 0)
+            ((0, -1), "Tilt up", (WIDTH // 2) - (button_size // 2), video_top + margin, 0, 1),
+            ((0, 1), "Tilt down", (WIDTH // 2) - (button_size // 2), video_bottom - button_size - margin, 0, -1),
+            ((-1, 0), "Pan left", margin, (HEIGHT // 2) - (button_size // 2), -1, 0),
+            ((1, 0), "Pan right", WIDTH - button_size - margin, (HEIGHT // 2) - (button_size // 2), 1, 0)
         ]
 
-        for icon_enum, x, y, vx, vy in controls:
+        for direction, tooltip, x, y, vx, vy in controls:
             btn = QPushButton(self.video_label)
             btn.setFixedSize(button_size, button_size)
             btn.move(int(x), int(y))
-
-            icon = self.style().standardIcon(icon_enum)
-            btn.setIcon(icon)
-            btn.setIconSize(QSize(16, 16))
-
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tooltip)
+            btn.setIcon(self._make_arrow_icon(*direction, icon_size))
+            btn.setIconSize(QSize(icon_size, icon_size))
             btn.setStyleSheet(STYLE_PTZ_BTN)
+            btn.raise_()
 
             btn.pressed.connect(lambda v_x=vx, v_y=vy: self.ptz_service.move(v_x, v_y))
             btn.released.connect(self.ptz_service.stop)
+
+    def _make_arrow_icon(self, dx: int, dy: int, size: int) -> QIcon:
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        center = QPointF(size / 2, size / 2)
+        direction = QPointF(dx, dy)
+        perpendicular = QPointF(-dy, dx)
+        start = center - direction * 5
+        end = center + direction * 5
+        head_a = end - direction * 5 + perpendicular * 4
+        head_b = end - direction * 5 - perpendicular * 4
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#20252b"), 3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawLine(start, end)
+        painter.drawLine(end, head_a)
+        painter.drawLine(end, head_b)
+        painter.end()
+
+        return QIcon(pixmap)
 
     def stop_motors(self):
         """Called during application shutdown to ensure no cameras are left spinning."""

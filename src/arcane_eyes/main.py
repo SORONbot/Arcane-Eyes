@@ -7,7 +7,7 @@ load_dotenv()
 from PyQt6.QtCore import Qt, QThreadPool, pyqtSlot, QRunnable, QObject, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QGridLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QMessageBox, QDialog
 )
 
@@ -25,12 +25,15 @@ from arcane_eyes.core.models import CameraDevice
 
 # Import Logic and Services
 from arcane_eyes.logic.stream_manager import StreamManager
+from arcane_eyes.logic.adoption_worker import CameraAdoptionWorker
 from arcane_eyes.services.discovery_service import NetworkDiscoveryService
+from arcane_eyes.services.provisioning_service import CameraAdoptionService
 from arcane_eyes.services.stream_service import StreamService
 from arcane_eyes.services.recorder_service import PyAVRecorderService
 
 # Import Custom UI Widgets
 from arcane_eyes.ui.camera_widget import CameraDisplayWidget
+from arcane_eyes.ui.add_camera_dialog import AddCameraDialog
 from arcane_eyes.ui.record_dialog import RecordDialog
 
 
@@ -66,6 +69,7 @@ class ArcaneEyesMainWindow(QMainWindow):
         self.stream_manager = StreamManager()
         self.stream_service = StreamService(target_width=WIDTH, target_height=HEIGHT)
         self.discovery_service = NetworkDiscoveryService(timeout=SCAN_TIMEOUT)
+        self.adoption_service = CameraAdoptionService(self.discovery_service)
         self.thread_pool = QThreadPool()
 
         # State Tracking
@@ -73,6 +77,8 @@ class ArcaneEyesMainWindow(QMainWindow):
         self.active_recorders = {}  # ip -> PyAVRecorderService
         self.display_widgets = {}  # ip -> CameraDisplayWidget
         self.cam_count = 0
+        self.add_camera_dialog = None
+        self.adoption_worker = None
 
         self._setup_ui()
 
@@ -112,9 +118,17 @@ class ArcaneEyesMainWindow(QMainWindow):
         self.central_widget = QWidget()
         self.main_layout = QVBoxLayout(self.central_widget)
 
+        button_row = QHBoxLayout()
+
         self.scan_button = QPushButton("Scan Network for Eyes")
         self.scan_button.clicked.connect(self.run_background_scan)
-        self.main_layout.addWidget(self.scan_button)
+        button_row.addWidget(self.scan_button)
+
+        self.add_camera_button = QPushButton("Add Camera")
+        self.add_camera_button.clicked.connect(self.open_add_camera_dialog)
+        button_row.addWidget(self.add_camera_button)
+
+        self.main_layout.addLayout(button_row)
 
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout(self.grid_widget)
@@ -144,6 +158,72 @@ class ArcaneEyesMainWindow(QMainWindow):
         self.scan_button.setEnabled(True)
         self.scan_button.setText("Scan Network for Eyes")
         print(f"Discovery Error: {error_msg}")
+
+    def open_add_camera_dialog(self):
+        self.add_camera_dialog = AddCameraDialog(self)
+        self.add_camera_dialog.provisioning_started.connect(self.start_camera_adoption)
+        self.add_camera_dialog.retry_requested.connect(self.retry_camera_adoption)
+        self.add_camera_dialog.cancelled.connect(self.cancel_camera_adoption)
+        self.add_camera_dialog.exec()
+
+    def start_camera_adoption(self, payload=None):
+        self.cancel_camera_adoption()
+
+        network_range = DEFAULT_SCAN_RANGE
+        if payload and getattr(payload, "network_range", None):
+            network_range = payload.network_range
+        elif self.add_camera_dialog:
+            try:
+                network_range = self.add_camera_dialog.get_network_range()
+            except ValueError as exc:
+                self.add_camera_dialog.set_error(str(exc))
+                return
+
+        if self.add_camera_dialog:
+            self.add_camera_dialog.set_scanning_state()
+
+        self.adoption_worker = CameraAdoptionWorker(
+            adoption_service=self.adoption_service,
+            known_ips=self.active_devices.keys(),
+            timeout_seconds=180,
+            network_range=network_range,
+        )
+        self.adoption_worker.signals.progress.connect(self.on_adoption_progress)
+        self.adoption_worker.signals.camera_adopted.connect(self.on_camera_adopted)
+        self.adoption_worker.signals.timeout.connect(self.on_adoption_timeout)
+        self.adoption_worker.signals.error.connect(self.on_adoption_error)
+        self.adoption_worker.signals.finished.connect(self.on_adoption_finished)
+        self.thread_pool.start(self.adoption_worker)
+
+    def retry_camera_adoption(self):
+        self.start_camera_adoption()
+
+    def cancel_camera_adoption(self):
+        if self.adoption_worker:
+            self.adoption_worker.stop()
+
+    def on_adoption_progress(self, remaining_seconds: int):
+        if self.add_camera_dialog:
+            self.add_camera_dialog.set_progress(remaining_seconds)
+
+    def on_camera_adopted(self, ip: str):
+        self.add_camera(ip)
+        self._save_cache()
+
+        if self.add_camera_dialog:
+            self.add_camera_dialog.set_success(ip)
+
+    def on_adoption_timeout(self):
+        if self.add_camera_dialog:
+            self.add_camera_dialog.set_timeout()
+
+    def on_adoption_error(self, error_msg: str):
+        if self.add_camera_dialog:
+            self.add_camera_dialog.set_error(error_msg)
+        print(f"Adoption Error: {error_msg}")
+
+    def on_adoption_finished(self):
+        self.adoption_worker = None
 
     def add_camera(self, ip: str):
         if ip in self.active_devices:
@@ -233,6 +313,8 @@ class ArcaneEyesMainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             # Save the cache right before shutting down!
             self._save_cache()
+
+            self.cancel_camera_adoption()
 
             for widget in self.display_widgets.values():
                 widget.stop_motors()

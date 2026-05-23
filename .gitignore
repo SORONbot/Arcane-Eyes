@@ -191,3 +191,7 @@ recordings/
 
 repomix-output.xml
 .eye_cache
+.rag/
+.pytest_cache/
+.idea/
+.setup_qr_credentials
