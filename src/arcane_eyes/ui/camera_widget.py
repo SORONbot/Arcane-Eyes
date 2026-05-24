@@ -1,22 +1,57 @@
-from PyQt6.QtCore import QPointF, QSize, Qt
+from PyQt6.QtCore import QPointF, QRect, QSize, Qt
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QSizePolicy
 
 from arcane_eyes.core.constants import WIDTH, HEIGHT, STYLE_PTZ_BTN
 from arcane_eyes.core.exceptions import PTZError
 from arcane_eyes.services.ptz_service import OnvifPTZService
 
+
+class VideoLabel(QLabel):
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._source_pixmap = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def set_frame(self, pixmap: QPixmap):
+        self._source_pixmap = pixmap
+        self.update()
+
+    def content_rect(self) -> QRect:
+        if not self._source_pixmap or self._source_pixmap.isNull():
+            return self.rect()
+
+        scaled_size = self._source_pixmap.size()
+        scaled_size.scale(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        x = (self.width() - scaled_size.width()) // 2
+        y = (self.height() - scaled_size.height()) // 2
+        return QRect(x, y, scaled_size.width(), scaled_size.height())
+
+    def paintEvent(self, event):
+        if not self._source_pixmap or self._source_pixmap.isNull():
+            super().paintEvent(event)
+            return
+
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#13202c"))
+        painter.drawPixmap(self.content_rect(), self._source_pixmap)
+
+
 class CameraDisplayWidget(QWidget):
     """
     UI Component for displaying a single camera feed and its PTZ controls.
     """
-    def __init__(self, ip: str, parent=None):
+    def __init__(self, ip: str, parent=None, show_ptz: bool = True, fixed_size: bool = False):
         super().__init__(parent)
         self.ip = ip
+        self.show_ptz = show_ptz
+        self.fixed_size = fixed_size
         self.ptz_service = None
         self.ptz_supported = False
+        self.ptz_buttons = []
 
-        self._init_ptz()
+        if self.show_ptz:
+            self._init_ptz()
         self._setup_ui()
 
     def _init_ptz(self):
@@ -33,35 +68,39 @@ class CameraDisplayWidget(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
 
         # Video Label bounded by constants
-        self.video_label = QLabel(f"Connecting to {self.ip}...")
-        self.video_label.setFixedSize(WIDTH, HEIGHT)
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label = VideoLabel(f"Connecting to {self.ip}...")
+        self.video_label.setStyleSheet("background: #13202c;")
+        if self.fixed_size:
+            self.video_label.setFixedSize(WIDTH, HEIGHT)
+            self.setFixedSize(WIDTH, HEIGHT)
+        else:
+            self.video_label.setMinimumSize(1, 1)
+            self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.layout.addWidget(self.video_label)
 
         # Only draw overlay controls if the camera actually supports them
-        if self.ptz_supported:
+        if self.show_ptz and self.ptz_supported:
             self._create_overlay_buttons()
+
+    def set_frame(self, pixmap: QPixmap):
+        self.video_label.set_frame(pixmap)
+        self._position_ptz_buttons()
 
     def _create_overlay_buttons(self):
         button_size = 32
-        margin = 12
         icon_size = 18
 
-        visible_height = min(HEIGHT, int(WIDTH * 9 / 16))
-        video_top = max(0, (HEIGHT - visible_height) // 2)
-        video_bottom = video_top + visible_height
-
         controls = [
-            ((0, -1), "Tilt up", (WIDTH // 2) - (button_size // 2), video_top + margin, 0, 1),
-            ((0, 1), "Tilt down", (WIDTH // 2) - (button_size // 2), video_bottom - button_size - margin, 0, -1),
-            ((-1, 0), "Pan left", margin, (HEIGHT // 2) - (button_size // 2), -1, 0),
-            ((1, 0), "Pan right", WIDTH - button_size - margin, (HEIGHT // 2) - (button_size // 2), 1, 0)
+            ("top", (0, -1), "Tilt up", 0, 1),
+            ("bottom", (0, 1), "Tilt down", 0, -1),
+            ("left", (-1, 0), "Pan left", -1, 0),
+            ("right", (1, 0), "Pan right", 1, 0),
         ]
 
-        for direction, tooltip, x, y, vx, vy in controls:
+        for edge, direction, tooltip, vx, vy in controls:
             btn = QPushButton(self.video_label)
             btn.setFixedSize(button_size, button_size)
-            btn.move(int(x), int(y))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolTip(tooltip)
             btn.setIcon(self._make_arrow_icon(*direction, icon_size))
@@ -71,6 +110,34 @@ class CameraDisplayWidget(QWidget):
 
             btn.pressed.connect(lambda v_x=vx, v_y=vy: self.ptz_service.move(v_x, v_y))
             btn.released.connect(self.ptz_service.stop)
+            self.ptz_buttons.append((edge, btn))
+
+        self._position_ptz_buttons()
+
+    def _position_ptz_buttons(self):
+        if not self.ptz_buttons:
+            return
+
+        button_size = 32
+        margin = 12
+        rect = self.video_label.content_rect()
+        center_x = rect.left() + (rect.width() - button_size) // 2
+        center_y = rect.top() + (rect.height() - button_size) // 2
+        positions = {
+            "top": (center_x, rect.top() + margin),
+            "bottom": (center_x, rect.bottom() - button_size - margin + 1),
+            "left": (rect.left() + margin, center_y),
+            "right": (rect.right() - button_size - margin + 1, center_y),
+        }
+
+        for edge, btn in self.ptz_buttons:
+            x, y = positions[edge]
+            btn.move(max(0, int(x)), max(0, int(y)))
+            btn.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_ptz_buttons()
 
     def _make_arrow_icon(self, dx: int, dy: int, size: int) -> QIcon:
         pixmap = QPixmap(size, size)

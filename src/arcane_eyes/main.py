@@ -1,6 +1,12 @@
+import csv
+from dataclasses import dataclass
+from io import BytesIO, StringIO
 import sys
-import os
+from functools import partial
+from ipaddress import ip_address
 from pathlib import Path
+
+import qrcode
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,41 +14,123 @@ load_dotenv()
 from PyQt6.QtCore import Qt, QThreadPool, pyqtSlot, QRunnable, QObject, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QIcon
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QMessageBox, QDialog
+    QApplication,
+    QDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
-# Import Configs
 from arcane_eyes.core.config import DEFAULT_SCAN_RANGE, CACHE_FILE_PATH
-
-# Import Constants (INCLUDING STYLES)
 from arcane_eyes.core.constants import (
-    WIDTH, HEIGHT, SCAN_TIMEOUT,
-    STYLE_RECORD_BTN_ACTIVE, STYLE_RECORD_BTN_DEFAULT
+    HEIGHT,
+    SCAN_TIMEOUT,
+    STYLE_RECORD_BTN_ACTIVE,
+    STYLE_RECORD_BTN_DEFAULT,
+    WIDTH,
 )
-
-# Import Core Models
-from arcane_eyes.core.models import CameraDevice
-
-# Import Logic and Services
-from arcane_eyes.logic.stream_manager import StreamManager
+from arcane_eyes.core.models import CameraDevice, ConnectionStatus
 from arcane_eyes.logic.adoption_worker import CameraAdoptionWorker
+from arcane_eyes.logic.stream_manager import StreamManager
 from arcane_eyes.services.discovery_service import NetworkDiscoveryService
-from arcane_eyes.services.provisioning_service import CameraAdoptionService
-from arcane_eyes.services.stream_service import StreamService
+from arcane_eyes.services.provisioning_service import (
+    CameraAdoptionService,
+    SetupQrCredentialCache,
+    WifiProvisioningPayload,
+    normalize_network_range,
+)
 from arcane_eyes.services.recorder_service import PyAVRecorderService
-
-# Import Custom UI Widgets
-from arcane_eyes.ui.camera_widget import CameraDisplayWidget
+from arcane_eyes.services.stream_service import StreamService
 from arcane_eyes.ui.add_camera_dialog import AddCameraDialog
+from arcane_eyes.ui.camera_widget import CameraDisplayWidget
 from arcane_eyes.ui.record_dialog import RecordDialog
 
 
 APP_ICON_PATH = Path(__file__).resolve().parents[2] / "assets" / "arcane-eye-icon.png"
+FEEDS_PER_PAGE = 4
+CLOCKWISE_GRID_POSITIONS = [(0, 0), (0, 1), (1, 1), (1, 0)]
+CAMERA_CACHE_HEADER = ["id", "ip", "display_name"]
 
 
 def make_app_icon() -> QIcon:
     return QIcon(str(APP_ICON_PATH))
+
+
+@dataclass
+class CameraCacheEntry:
+    id: int
+    ip: str
+    display_name: str
+
+
+def parse_camera_cache(serialized_cache: str) -> list[CameraCacheEntry]:
+    if not serialized_cache.strip():
+        return []
+
+    try:
+        reader = csv.DictReader(StringIO(serialized_cache))
+        if reader.fieldnames != CAMERA_CACHE_HEADER:
+            return []
+
+        entries = []
+        seen_ids = set()
+        seen_ips = set()
+        for row in reader:
+            if set(row.keys()) != set(CAMERA_CACHE_HEADER):
+                return []
+
+            try:
+                camera_id = int((row.get("id") or "").strip())
+            except ValueError:
+                return []
+            if camera_id <= 0 or camera_id in seen_ids:
+                return []
+
+            ip = (row.get("ip") or "").strip()
+            try:
+                ip_address(ip)
+            except ValueError:
+                return []
+            if ip in seen_ips:
+                return []
+
+            display_name = (row.get("display_name") or "").strip()
+            if not display_name:
+                return []
+
+            entries.append(CameraCacheEntry(id=camera_id, ip=ip, display_name=display_name))
+            seen_ids.add(camera_id)
+            seen_ips.add(ip)
+    except csv.Error:
+        return []
+
+    return sorted(entries, key=lambda entry: entry.id)
+
+
+def serialize_camera_cache(entries: list[CameraCacheEntry]) -> str:
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=CAMERA_CACHE_HEADER, lineterminator="\n")
+    writer.writeheader()
+    for entry in sorted(entries, key=lambda camera: camera.id):
+        writer.writerow({
+            "id": entry.id,
+            "ip": entry.ip,
+            "display_name": entry.display_name,
+        })
+    return output.getvalue()
+
+
+def grid_position_for_feed(slot_index: int) -> tuple[int, int]:
+    return CLOCKWISE_GRID_POSITIONS[slot_index]
 
 
 class DiscoveryWorkerSignals(QObject):
@@ -67,109 +155,711 @@ class DiscoveryWorker(QRunnable):
             self.signals.error.emit(str(e))
 
 
+class FeedCard(QFrame):
+    def __init__(
+        self,
+        ip: str,
+        display_name: str,
+        display_widget: CameraDisplayWidget,
+        on_open,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.ip = ip
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("feedCard")
+        self.setStyleSheet("""
+            QFrame#feedCard {
+                border: 1px solid #405468;
+                border-radius: 8px;
+                background: #1d2a36;
+            }
+            QFrame#feedCard:hover {
+                border-color: #6f8fac;
+                background: #223242;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        title = QLabel(display_name)
+        title.setStyleSheet("font-weight: 700; color: #d7e1ea; background: transparent; border: none;")
+        layout.addWidget(title)
+        ip_label = QLabel(ip)
+        ip_label.setStyleSheet("color: #9fb0bf; background: transparent; border: none;")
+        layout.addWidget(ip_label)
+        layout.addWidget(display_widget, 1)
+
+        self._on_open = on_open
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._on_open(self.ip)
+        super().mousePressEvent(event)
+
+
 class ArcaneEyesMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Arcane Eyes")
         self.setWindowIcon(make_app_icon())
         self.resize(1280, 720)
+        self.setMinimumSize(760, 480)
 
-        # Initialize Core Services & Managers using Config/Constants
         self.stream_manager = StreamManager()
         self.stream_service = StreamService(target_width=WIDTH, target_height=HEIGHT)
         self.discovery_service = NetworkDiscoveryService(timeout=SCAN_TIMEOUT)
         self.adoption_service = CameraAdoptionService(self.discovery_service)
+        self.credential_cache = SetupQrCredentialCache()
         self.thread_pool = QThreadPool()
 
-        # State Tracking
-        self.active_devices = {}  # ip -> CameraDevice
-        self.active_recorders = {}  # ip -> PyAVRecorderService
-        self.display_widgets = {}  # ip -> CameraDisplayWidget
-        self.cam_count = 0
+        self.active_devices = {}
+        self.active_recorders = {}
+        self.camera_entries = {}
+        self.display_widgets = {}
+        self.active_record_buttons = {}
+        self.current_page = 0
+        self.is_scanning_network = False
         self.add_camera_dialog = None
         self.adoption_worker = None
 
         self._setup_ui()
-
-        # Load the cache first
-        self._load_cache()
-
-        # Only auto-scan if no cameras were loaded from the cache
-        if not self.active_devices:
-            self.run_background_scan()
-
-    def _load_cache(self):
-        """Reads the .eye_cache file and restores previous camera sessions."""
-        if CACHE_FILE_PATH.exists():
-            try:
-                with open(CACHE_FILE_PATH, "r") as f:
-                    serialized_ips = f.read().strip()
-
-                if serialized_ips:
-                    cached_ips = serialized_ips.split(",")
-                    for ip in cached_ips:
-                        if ip:  # Guard against empty strings
-                            self.add_camera(ip)
-            except Exception as e:
-                print(f"Failed to load .eye_cache: {e}")
-
-    def _save_cache(self):
-        """Serializes the currently active IPs into a comma-separated string."""
-        try:
-            # We only cache the IPs of cameras that successfully connected/were added
-            serialized_ips = ",".join(self.active_devices.keys())
-            with open(CACHE_FILE_PATH, "w") as f:
-                f.write(serialized_ips)
-        except Exception as e:
-            print(f"Failed to save .eye_cache: {e}")
+        for camera_entry in self.load_cached_cameras():
+            self.add_camera(camera_entry.ip, persist=False, cache_entry=camera_entry)
+        self.show_feed_dashboard()
 
     def _setup_ui(self):
         self.central_widget = QWidget()
-        self.main_layout = QVBoxLayout(self.central_widget)
+        self.root_layout = QHBoxLayout(self.central_widget)
+        self.root_layout.setContentsMargins(0, 0, 0, 0)
+        self.root_layout.setSpacing(0)
 
-        button_row = QHBoxLayout()
+        self.sidebar = QFrame()
+        self.sidebar.setFixedWidth(150)
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setStyleSheet("""
+            QFrame#sidebar {
+                background: #243344;
+                border-right: 1px solid #33475d;
+            }
+            QPushButton {
+                min-height: 38px;
+                text-align: left;
+                padding-left: 14px;
+            }
+        """)
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(10, 14, 10, 14)
+        sidebar_layout.setSpacing(10)
 
-        self.scan_button = QPushButton("Scan Network for Eyes")
+        app_label = QLabel("Arcane Eyes")
+        app_label.setStyleSheet(
+            "font-size: 15px; font-weight: 700; color: #d7e1ea; background: transparent; border: none;"
+        )
+        sidebar_layout.addWidget(app_label)
+
+        self.feeds_button = QPushButton("Feeds")
+        self.feeds_button.clicked.connect(self.show_feed_dashboard)
+        sidebar_layout.addWidget(self.feeds_button)
+
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.clicked.connect(self.show_settings_screen)
+        sidebar_layout.addWidget(self.settings_button)
+
+        self.scan_button = QPushButton("Scan Network")
         self.scan_button.clicked.connect(self.run_background_scan)
-        button_row.addWidget(self.scan_button)
+        sidebar_layout.addWidget(self.scan_button)
 
-        self.add_camera_button = QPushButton("Add Camera")
-        self.add_camera_button.clicked.connect(self.open_add_camera_dialog)
-        button_row.addWidget(self.add_camera_button)
+        sidebar_layout.addStretch(1)
 
-        self.main_layout.addLayout(button_row)
+        self.quit_button = QPushButton("Quit")
+        self.quit_button.clicked.connect(self.close)
+        sidebar_layout.addWidget(self.quit_button)
 
-        self.grid_widget = QWidget()
-        self.grid_layout = QGridLayout(self.grid_widget)
-        self.main_layout.addWidget(self.grid_widget)
+        self.content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self.content_widget)
+        self.content_layout.setContentsMargins(18, 18, 18, 18)
+        self.content_layout.setSpacing(14)
 
+        self.root_layout.addWidget(self.sidebar)
+        self.root_layout.addWidget(self.content_widget, 1)
         self.setCentralWidget(self.central_widget)
 
+    def _clear_content(self):
+        for widget in self.display_widgets.values():
+            widget.stop_motors()
+        self.active_record_buttons.clear()
+        self.display_widgets.clear()
+        while self.content_layout.count():
+            item = self.content_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            child_layout = item.layout()
+            if child_layout:
+                self._clear_layout(child_layout)
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            child_layout = item.layout()
+            if child_layout:
+                self._clear_layout(child_layout)
+
+    def load_cached_cameras(self) -> list[CameraCacheEntry]:
+        if not CACHE_FILE_PATH.exists():
+            return []
+        try:
+            serialized_cache = CACHE_FILE_PATH.read_text()
+        except OSError as exc:
+            print(f"Failed to load .eye_cache: {exc}")
+            return []
+        return parse_camera_cache(serialized_cache)
+
+    def save_cached_cameras(self):
+        try:
+            CACHE_FILE_PATH.write_text(serialize_camera_cache(self.sorted_camera_entries()))
+        except OSError as exc:
+            print(f"Failed to save .eye_cache: {exc}")
+
+    def _save_cache(self):
+        self.save_cached_cameras()
+
+    def load_cached_ips(self) -> list[str]:
+        return [entry.ip for entry in self.load_cached_cameras()]
+
+    def save_cached_ips(self):
+        self.save_cached_cameras()
+
+    def sorted_camera_entries(self) -> list[CameraCacheEntry]:
+        return sorted(self.camera_entries.values(), key=lambda entry: entry.id)
+
+    def sorted_camera_ips(self) -> list[str]:
+        return [entry.ip for entry in self.sorted_camera_entries()]
+
+    def next_camera_cache_id(self) -> int:
+        if not self.camera_entries:
+            return 1
+        return max(entry.id for entry in self.camera_entries.values()) + 1
+
+    def display_name_for_ip(self, ip: str) -> str:
+        entry = self.camera_entries.get(ip)
+        return entry.display_name if entry else ip
+
+    def show_feed_dashboard(self):
+        self._clear_content()
+        self.refresh_feed_grid()
+
+    def refresh_feed_grid(self):
+        ips = self.sorted_camera_ips()
+        max_page = max(0, (len(ips) - 1) // FEEDS_PER_PAGE)
+        self.current_page = min(self.current_page, max_page)
+
+        title = QLabel("Feeds")
+        title.setStyleSheet("font-size: 22px; font-weight: 700; color: #d7e1ea;")
+        self.content_layout.addWidget(title)
+
+        feed_area = QFrame()
+        feed_area.setObjectName("feedArea")
+        feed_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        feed_area.setStyleSheet("""
+            QFrame#feedArea {
+                background: #13202c;
+                border: 1px solid #26394d;
+                border-radius: 8px;
+            }
+        """)
+        feed_layout = QGridLayout(feed_area)
+        feed_layout.setContentsMargins(12, 12, 12, 12)
+        feed_layout.setSpacing(12)
+
+        if not ips:
+            message = "Scanning the Network" if self.is_scanning_network else "No eyes found yet"
+            empty_label = QLabel(message)
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_label.setStyleSheet("font-size: 26px; color: #aebdcc; font-weight: 700;")
+            feed_layout.addWidget(empty_label, 0, 0, 2, 2)
+        else:
+            page_start = self.current_page * FEEDS_PER_PAGE
+            page_ips = ips[page_start:page_start + FEEDS_PER_PAGE]
+            for slot_index, ip in enumerate(page_ips):
+                display_widget = CameraDisplayWidget(ip=ip, show_ptz=False, fixed_size=False)
+                self.display_widgets[ip] = display_widget
+                card = FeedCard(ip, self.display_name_for_ip(ip), display_widget, self.open_feed_detail)
+                row, col = grid_position_for_feed(slot_index)
+                feed_layout.addWidget(card, row, col)
+
+            for row in range(2):
+                feed_layout.setRowStretch(row, 1)
+            for col in range(2):
+                feed_layout.setColumnStretch(col, 1)
+
+        self.content_layout.addWidget(feed_area, 1)
+
+        pagination = QHBoxLayout()
+        pagination.addStretch(1)
+        self.prev_page_button = QPushButton("‹")
+        self.next_page_button = QPushButton("›")
+        for button, tooltip in (
+            (self.prev_page_button, "Previous page"),
+            (self.next_page_button, "Next page"),
+        ):
+            button.setToolTip(tooltip)
+            button.setFixedSize(34, 30)
+            button.setStyleSheet("""
+                QPushButton {
+                    font-size: 18px;
+                    font-weight: 700;
+                    line-height: 30px;
+                    padding: 0;
+                    text-align: center;
+                }
+            """)
+        self.prev_page_button.clicked.connect(self.show_previous_page)
+        self.next_page_button.clicked.connect(self.show_next_page)
+        self.prev_page_button.setEnabled(self.current_page > 0)
+        self.next_page_button.setEnabled(self.current_page < max_page)
+        pagination.addWidget(self.prev_page_button)
+        pagination.addWidget(self.next_page_button)
+        pagination.addStretch(1)
+        self.content_layout.addLayout(pagination)
+
+    def show_previous_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.show_feed_dashboard()
+
+    def show_next_page(self):
+        if self.current_page < (len(self.active_devices) - 1) // FEEDS_PER_PAGE:
+            self.current_page += 1
+            self.show_feed_dashboard()
+
+    def open_feed_detail(self, ip: str):
+        if ip not in self.active_devices:
+            return
+
+        self._clear_content()
+        title = QLabel(f"Camera Detail - {self.display_name_for_ip(ip)}")
+        title.setStyleSheet("font-size: 22px; font-weight: 700; color: #d7e1ea;")
+        self.content_layout.addWidget(title)
+
+        detail_row = QHBoxLayout()
+        detail_row.setSpacing(14)
+
+        video_panel = QFrame()
+        video_panel.setObjectName("videoPanel")
+        video_panel.setStyleSheet("""
+            QFrame#videoPanel {
+                background: #13202c;
+                border: 1px solid #26394d;
+                border-radius: 8px;
+            }
+        """)
+        video_layout = QVBoxLayout(video_panel)
+        video_layout.setContentsMargins(10, 10, 10, 10)
+        display_widget = CameraDisplayWidget(ip=ip, show_ptz=True, fixed_size=False)
+        self.display_widgets[ip] = display_widget
+        video_layout.addWidget(display_widget)
+
+        controls_panel = self._build_detail_controls(ip)
+        detail_row.addWidget(video_panel, 1)
+        detail_row.addWidget(controls_panel)
+        self.content_layout.addLayout(detail_row, 1)
+
+    def _build_detail_controls(self, ip: str) -> QWidget:
+        panel = QFrame()
+        panel.setFixedWidth(260)
+        panel.setObjectName("controlsPanel")
+        panel.setStyleSheet("""
+            QFrame#controlsPanel {
+                background: #1d2a36;
+                border: 1px solid #405468;
+                border-radius: 8px;
+            }
+        """)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
+
+        record_button = QPushButton("Record")
+        record_button.setMinimumHeight(74)
+        record_button.setStyleSheet(STYLE_RECORD_BTN_DEFAULT)
+        record_button.clicked.connect(partial(self.toggle_recording, ip))
+        layout.addWidget(record_button)
+        self.active_record_buttons[ip] = record_button
+
+        snapshot_button = QPushButton("Snapshot")
+        snapshot_button.setEnabled(False)
+        live_button = QPushButton("Live View")
+        live_button.setEnabled(False)
+        action_row = QHBoxLayout()
+        action_row.addWidget(snapshot_button)
+        action_row.addWidget(live_button)
+        layout.addLayout(action_row)
+
+        controls_title = QLabel("Camera Controls")
+        controls_title.setStyleSheet("background: #405468; color: #d7e1ea; font-weight: 700; padding: 8px;")
+        layout.addWidget(controls_title)
+        for label in ("Motion Detection", "Night Vision", "IR Illumination"):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            toggle = QPushButton("Unavailable")
+            toggle.setEnabled(False)
+            row.addWidget(toggle)
+            layout.addLayout(row)
+
+        details_title = QLabel("Camera Technical Details")
+        details_title.setStyleSheet("background: #405468; color: #d7e1ea; font-weight: 700; padding: 8px;")
+        layout.addWidget(details_title)
+        device = self.active_devices[ip]
+        details = {
+            "Name": self.display_name_for_ip(ip),
+            "IP Address": ip,
+            "Resolution": f"{WIDTH}x{HEIGHT}",
+            "Status": device.status.name.title(),
+        }
+        for label, value in details.items():
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{label}:"))
+            value_label = QLabel(value)
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+            row.addWidget(value_label)
+            layout.addLayout(row)
+
+        layout.addStretch(1)
+        return panel
+
+    def show_settings_screen(self):
+        self._clear_content()
+        title = QLabel("Settings")
+        title.setStyleSheet("font-size: 22px; font-weight: 700; color: #d7e1ea;")
+        self.content_layout.addWidget(title)
+
+        tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #405468;
+                background: #13202c;
+            }
+        """)
+        tabs.addTab(self._build_configured_cameras_tab(), "Configured Cameras")
+        tabs.addTab(self._build_networks_tab(), "Networks")
+        self.content_layout.addWidget(tabs, 1)
+
+    def _build_configured_cameras_tab(self) -> QWidget:
+        container = QWidget()
+        layout = QGridLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(8)
+
+        headers = ["ID", "IP Address", "Display Name", "Status", "Order", ""]
+        for col, header in enumerate(headers):
+            label = QLabel(header)
+            label.setStyleSheet("font-weight: 700; color: #d7e1ea;")
+            layout.addWidget(label, 0, col)
+
+        entries = self.sorted_camera_entries()
+        if not entries:
+            empty_label = QLabel("No configured cameras.")
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(empty_label, 1, 0, 1, len(headers))
+        else:
+            for row, entry in enumerate(entries, start=1):
+                id_label = QLabel(str(entry.id))
+                ip_input = QLineEdit(entry.ip)
+                name_input = QLineEdit(entry.display_name)
+                status = self.active_devices.get(entry.ip)
+                status_label = QLabel(status.status.name.title() if status else "Disconnected")
+
+                up_button = QPushButton("↑")
+                down_button = QPushButton("↓")
+                up_button.setFixedWidth(34)
+                down_button.setFixedWidth(34)
+                up_button.setEnabled(row > 1)
+                down_button.setEnabled(row < len(entries))
+                up_button.clicked.connect(partial(self.move_camera_entry, entry.ip, -1))
+                down_button.clicked.connect(partial(self.move_camera_entry, entry.ip, 1))
+
+                order_row = QHBoxLayout()
+                order_row.addWidget(up_button)
+                order_row.addWidget(down_button)
+
+                save_button = QPushButton("Save")
+                save_button.clicked.connect(partial(self.save_camera_settings, entry.ip, ip_input, name_input))
+
+                layout.addWidget(id_label, row, 0)
+                layout.addWidget(ip_input, row, 1)
+                layout.addWidget(name_input, row, 2)
+                layout.addWidget(status_label, row, 3)
+                layout.addLayout(order_row, row, 4)
+                layout.addWidget(save_button, row, 5)
+
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(2, 1)
+        layout.setRowStretch(max(1, len(entries) + 1), 1)
+        return container
+
+    def _build_networks_tab(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
+
+        if not self.credential_cache.is_enabled:
+            message = QLabel(self.credential_cache.warning or "Network credential caching is disabled.")
+            message.setWordWrap(True)
+            layout.addWidget(message)
+            layout.addStretch(1)
+            return container
+
+        profiles = self.credential_cache.list_profiles()
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        headers = ["Network Range", "SSID", "Password", "", ""]
+        for col, header in enumerate(headers):
+            label = QLabel(header)
+            label.setStyleSheet("font-weight: 700; color: #d7e1ea;")
+            grid.addWidget(label, 0, col)
+
+        if not profiles:
+            empty_label = QLabel("No saved networks.")
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(empty_label, 1, 0, 1, len(headers))
+        else:
+            for row, (network_range, credentials) in enumerate(sorted(profiles.items()), start=1):
+                range_input = QLineEdit(network_range)
+                ssid_input = QLineEdit(credentials.ssid)
+                password_input = QLineEdit(credentials.password)
+                password_input.setEchoMode(QLineEdit.EchoMode.Password)
+
+                save_button = QPushButton("Save")
+                save_button.clicked.connect(
+                    partial(self.save_network_profile, network_range, range_input, ssid_input, password_input)
+                )
+                qr_button = QPushButton("Generate QR")
+                qr_button.clicked.connect(partial(self.generate_network_qr, range_input, ssid_input, password_input))
+
+                grid.addWidget(range_input, row, 0)
+                grid.addWidget(ssid_input, row, 1)
+                grid.addWidget(password_input, row, 2)
+                grid.addWidget(save_button, row, 3)
+                grid.addWidget(qr_button, row, 4)
+
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        layout.addLayout(grid)
+
+        layout.addStretch(1)
+        return container
+
+    def save_camera_settings(self, old_ip: str, ip_input: QLineEdit, name_input: QLineEdit):
+        new_ip = ip_input.text().strip()
+        display_name = name_input.text().strip()
+
+        try:
+            ip_address(new_ip)
+        except ValueError:
+            QMessageBox.warning(self, "Invalid IP Address", "Enter a valid camera IP address.")
+            return
+        if not display_name:
+            QMessageBox.warning(self, "Display Name Required", "Enter a display name for the camera.")
+            return
+        if new_ip != old_ip and new_ip in self.camera_entries:
+            QMessageBox.warning(self, "Duplicate IP Address", "A configured camera already uses that IP address.")
+            return
+
+        entry = self.camera_entries.get(old_ip)
+        if not entry:
+            return
+
+        if new_ip == old_ip:
+            entry.display_name = display_name
+            device = self.active_devices.get(old_ip)
+            if device:
+                device.name = display_name
+            self.save_cached_cameras()
+            self.show_settings_screen()
+            return
+
+        self.stop_camera_stream(old_ip)
+        device = self.active_devices.pop(old_ip, CameraDevice(ip=new_ip, status=ConnectionStatus.CONNECTING))
+        recorder = self.active_recorders.pop(old_ip, PyAVRecorderService())
+        self.display_widgets.pop(old_ip, None)
+        self.active_record_buttons.pop(old_ip, None)
+
+        entry.ip = new_ip
+        entry.display_name = display_name
+        self.camera_entries.pop(old_ip, None)
+        self.camera_entries[new_ip] = entry
+
+        device.ip = new_ip
+        device.name = display_name
+        device.status = ConnectionStatus.CONNECTING
+        self.active_devices[new_ip] = device
+        self.active_recorders[new_ip] = recorder
+        self.stream_manager.start_stream(
+            device=device,
+            stream_service=self.stream_service,
+            recorder_service=recorder,
+            on_frame_callback=partial(self.on_frame_received, new_ip),
+        )
+        self.save_cached_cameras()
+        self.show_settings_screen()
+
+    def move_camera_entry(self, ip: str, direction: int):
+        entries = self.sorted_camera_entries()
+        index = next((idx for idx, entry in enumerate(entries) if entry.ip == ip), None)
+        if index is None:
+            return
+        target_index = index + direction
+        if target_index < 0 or target_index >= len(entries):
+            return
+
+        entries[index].id, entries[target_index].id = entries[target_index].id, entries[index].id
+        self.save_cached_cameras()
+        self.show_settings_screen()
+
+    def save_network_profile(
+        self,
+        old_range: str,
+        range_input: QLineEdit,
+        ssid_input: QLineEdit,
+        password_input: QLineEdit,
+    ):
+        try:
+            network_range = normalize_network_range(range_input.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Network Range", str(exc))
+            return
+
+        ssid = ssid_input.text().strip()
+        if not ssid:
+            QMessageBox.warning(self, "SSID Required", "Enter the Wi-Fi network name.")
+            return
+
+        try:
+            saved = self.credential_cache.update_profile(old_range, network_range, ssid, password_input.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Network Save Failed", str(exc))
+            return
+        if not saved and self.credential_cache.warning:
+            QMessageBox.warning(self, "Network Save Disabled", self.credential_cache.warning)
+            return
+        self.show_settings_screen()
+
+    def generate_network_qr(
+        self,
+        range_input: QLineEdit,
+        ssid_input: QLineEdit,
+        password_input: QLineEdit,
+    ):
+        try:
+            network_range = normalize_network_range(range_input.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Network Range", str(exc))
+            return
+
+        ssid = ssid_input.text().strip()
+        if not ssid:
+            QMessageBox.warning(self, "SSID Required", "Enter the Wi-Fi network name.")
+            return
+
+        payload = WifiProvisioningPayload(
+            ssid=ssid,
+            password=password_input.text(),
+            network_range=network_range,
+        )
+        self.show_network_qr_dialog(network_range, self._make_qr_pixmap(payload.to_qr_text(), 320))
+
+    def show_network_qr_dialog(self, network_range: str, pixmap: QPixmap):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Setup QR - {network_range}")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(380)
+
+        layout = QVBoxLayout(dialog)
+        qr_label = QLabel()
+        qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qr_label.setPixmap(pixmap)
+        layout.addWidget(qr_label)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+
+        dialog.exec()
+
+    def _make_qr_pixmap(self, text: str, size: int) -> QPixmap:
+        image = qrcode.make(text)
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        pixmap = QPixmap()
+        pixmap.loadFromData(buffer.getvalue(), "PNG")
+        return pixmap.scaled(
+            size,
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def get_configured_scan_range(self) -> str | None:
+        try:
+            network_range = normalize_network_range(DEFAULT_SCAN_RANGE)
+            credentials = self.credential_cache.load(network_range)
+        except ValueError as exc:
+            print(f"Unable to read configured scan range: {exc}")
+            return None
+        if credentials:
+            return network_range
+        return None
+
     def run_background_scan(self):
+        network_range = self.get_configured_scan_range()
+        if not network_range:
+            self.open_add_camera_dialog()
+            return
+
+        self.is_scanning_network = True
         self.scan_button.setEnabled(False)
-        self.scan_button.setText(f"Scanning {DEFAULT_SCAN_RANGE}...")
+        self.scan_button.setText("Scan Network")
+        if not self.active_devices:
+            self.show_feed_dashboard()
 
-        worker = DiscoveryWorker(self.discovery_service, DEFAULT_SCAN_RANGE)
-
-        # Connect the live signal directly to the UI addition method
-        worker.signals.camera_found.connect(self.add_camera)
-
+        worker = DiscoveryWorker(self.discovery_service, network_range)
+        worker.signals.camera_found.connect(self.on_camera_discovered)
         worker.signals.finished.connect(self.on_scan_finished)
         worker.signals.error.connect(self.on_scan_error)
 
         self.thread_pool.start(worker)
 
+    def on_camera_discovered(self, ip: str):
+        self.add_camera(ip)
+
     def on_scan_finished(self):
+        self.is_scanning_network = False
         self.scan_button.setEnabled(True)
-        self.scan_button.setText("Scan Network for Eyes")
+        self.scan_button.setText("Scan Network")
+        if not self.active_devices:
+            self.show_feed_dashboard()
 
     def on_scan_error(self, error_msg: str):
+        self.is_scanning_network = False
         self.scan_button.setEnabled(True)
-        self.scan_button.setText("Scan Network for Eyes")
+        self.scan_button.setText("Scan Network")
+        if not self.active_devices:
+            self.show_feed_dashboard()
         print(f"Discovery Error: {error_msg}")
 
     def open_add_camera_dialog(self):
-        self.add_camera_dialog = AddCameraDialog(self)
+        self.add_camera_dialog = AddCameraDialog(self, credential_cache=self.credential_cache)
         self.add_camera_dialog.provisioning_started.connect(self.start_camera_adoption)
         self.add_camera_dialog.retry_requested.connect(self.retry_camera_adoption)
         self.add_camera_dialog.cancelled.connect(self.cancel_camera_adoption)
@@ -217,8 +907,6 @@ class ArcaneEyesMainWindow(QMainWindow):
 
     def on_camera_adopted(self, ip: str):
         self.add_camera(ip)
-        self._save_cache()
-
         if self.add_camera_dialog:
             self.add_camera_dialog.set_success(ip)
 
@@ -234,64 +922,65 @@ class ArcaneEyesMainWindow(QMainWindow):
     def on_adoption_finished(self):
         self.adoption_worker = None
 
-    def add_camera(self, ip: str):
+    def stop_camera_stream(self, ip: str):
+        if hasattr(self.stream_manager, "stop_stream"):
+            self.stream_manager.stop_stream(ip)
+
+    def add_camera(self, ip: str, persist: bool = True, cache_entry: CameraCacheEntry | None = None):
         if ip in self.active_devices:
             return
 
-        device = CameraDevice(ip=ip)
+        entry = cache_entry or self.camera_entries.get(ip)
+        if not entry:
+            entry = CameraCacheEntry(id=self.next_camera_cache_id(), ip=ip, display_name=ip)
+        self.camera_entries[ip] = entry
+
+        device = CameraDevice(ip=ip, name=entry.display_name, status=ConnectionStatus.CONNECTING)
         recorder_service = PyAVRecorderService()
 
         self.active_devices[ip] = device
         self.active_recorders[ip] = recorder_service
 
-        container = QWidget()
-        container.setFixedWidth(WIDTH + 20)  # Constrain the width to the video size + padding
-        v_layout = QVBoxLayout(container)
+        self.stream_manager.start_stream(
+            device=device,
+            stream_service=self.stream_service,
+            recorder_service=recorder_service,
+            on_frame_callback=partial(self.on_frame_received, ip),
+        )
+        if persist:
+            self.save_cached_cameras()
+            self.show_feed_dashboard()
 
-        display_widget = CameraDisplayWidget(ip=ip)
-        self.display_widgets[ip] = display_widget
+    def on_frame_received(self, ip: str, stream_frame):
+        device = self.active_devices.get(ip)
+        if device:
+            device.status = ConnectionStatus.CONNECTED
 
-        record_button = QPushButton("Record")
-        # Ensure the button doesn't look weirdly tall or wide
-        record_button.setFixedHeight(35)
-
-        def on_record_clicked():
-            if recorder_service.is_recording:
-                recorder_service.stop()  # Cancel the recording safely
-            else:
-                self.handle_record_request(ip)
-
-        record_button.clicked.connect(on_record_clicked)
-
-        v_layout.addWidget(display_widget)
-        v_layout.addWidget(record_button)
-
-        # 3 columns layout
-        row, col = divmod(self.cam_count, 3)
-        self.grid_layout.addWidget(container, row, col, Qt.AlignmentFlag.AlignTop)
-        self.cam_count += 1
-
-        def on_frame_received(stream_frame):
+        display_widget = self.display_widgets.get(ip)
+        if display_widget:
             rgb_data = self.stream_service.convert_for_ui(stream_frame.data)
             h, w, ch = rgb_data.shape
             bytes_per_line = ch * w
-
             qt_img = QImage(rgb_data.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            display_widget.video_label.setPixmap(QPixmap.fromImage(qt_img))
+            display_widget.set_frame(QPixmap.fromImage(qt_img))
 
+        record_button = self.active_record_buttons.get(ip)
+        if record_button:
             if stream_frame.is_recording:
-                record_button.setText("⏹ Stop Recording")
+                record_button.setText("Stop Recording")
                 record_button.setStyleSheet(STYLE_RECORD_BTN_ACTIVE)
             else:
                 record_button.setText("Record")
                 record_button.setStyleSheet(STYLE_RECORD_BTN_DEFAULT)
 
-        self.stream_manager.start_stream(
-            device=device,
-            stream_service=self.stream_service,
-            recorder_service=recorder_service,
-            on_frame_callback=on_frame_received
-        )
+    def toggle_recording(self, ip: str):
+        recorder = self.active_recorders.get(ip)
+        if not recorder:
+            return
+        if recorder.is_recording:
+            recorder.stop()
+        else:
+            self.handle_record_request(ip)
 
     def handle_record_request(self, ip: str):
         dlg = RecordDialog(ip, self)
@@ -305,7 +994,7 @@ class ArcaneEyesMainWindow(QMainWindow):
                 recorder.start(
                     rtsp_url=device.rtsp_url,
                     output_path=request.output_path,
-                    duration_minutes=request.duration_minutes
+                    duration_minutes=request.duration_minutes,
                 )
 
     def keyPressEvent(self, event: QKeyEvent):
@@ -314,15 +1003,15 @@ class ArcaneEyesMainWindow(QMainWindow):
 
     def closeEvent(self, event):
         reply = QMessageBox.question(
-            self, 'Exit?', 'Are you sure you want to exit?',
+            self,
+            "Exit?",
+            "Are you sure you want to exit?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.No,
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            # Save the cache right before shutting down!
-            self._save_cache()
-
+            self.save_cached_ips()
             self.cancel_camera_adoption()
 
             for widget in self.display_widgets.values():
@@ -337,8 +1026,9 @@ class ArcaneEyesMainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setWindowIcon(make_app_icon())
-    # Apply a nice dark theme (optional, since you have it in your dependencies)
+
     import qdarkstyle
+
     app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt6())
 
     window = ArcaneEyesMainWindow()

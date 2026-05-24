@@ -114,6 +114,34 @@ class SetupQrCredentialCache:
         self._write_profiles(profiles)
         return True
 
+    def list_profiles(self) -> dict[str, WifiCredentials]:
+        if not self.is_enabled:
+            return {}
+
+        profiles = self._read_profiles()
+        credentials = {}
+        for network_range, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            ssid = profile.get("ssid")
+            password = profile.get("password", "")
+            if isinstance(ssid, str) and isinstance(password, str):
+                credentials[network_range] = WifiCredentials(ssid=ssid, password=password)
+        return credentials
+
+    def update_profile(self, old_range: str, new_range: str, ssid: str, password: str) -> bool:
+        if not self.is_enabled:
+            return False
+
+        old_normalized_range = normalize_network_range(old_range)
+        new_normalized_range = normalize_network_range(new_range)
+        profiles = self._read_profiles()
+        if old_normalized_range != new_normalized_range:
+            profiles.pop(old_normalized_range, None)
+        profiles[new_normalized_range] = {"ssid": ssid, "password": password}
+        self._write_profiles(profiles)
+        return True
+
     def _read_profiles(self) -> dict[str, dict[str, str]]:
         if not self.cache_path.exists():
             return {}
