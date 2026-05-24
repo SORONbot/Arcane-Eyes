@@ -27,7 +27,7 @@ This project uses **uv** for ultra-fast dependency management and building.
 ---
 
 ## Tested With the Following Cameras:
-- 2 TG1/YQC13/DF2427196 (Configured with iCam365)
+- 2 TG1/YQC13/DF2427196
 
 ## Next Steps
 
