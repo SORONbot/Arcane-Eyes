@@ -24,6 +24,12 @@ class StreamManager:
         self.active_workers[device.ip] = worker
         self.thread_pool.start(worker)
 
+    def stop_stream(self, ip: str):
+        """Gracefully stop a single camera worker."""
+        worker = self.active_workers.pop(ip, None)
+        if worker:
+            worker.stop()
+
     def stop_all(self):
         """Graceful shutdown for all camera processes."""
         for worker in self.active_workers.values():
