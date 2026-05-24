@@ -1,6 +1,4 @@
-import csv
-from dataclasses import dataclass
-from io import BytesIO, StringIO
+from io import BytesIO
 import sys
 from functools import partial
 from ipaddress import ip_address
@@ -24,6 +22,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QComboBox,
     QSizePolicy,
     QTabWidget,
     QVBoxLayout,
@@ -38,10 +37,18 @@ from arcane_eyes.core.constants import (
     STYLE_RECORD_BTN_DEFAULT,
     WIDTH,
 )
-from arcane_eyes.core.models import CameraDevice, ConnectionStatus
+from arcane_eyes.core.models import CameraCapability, CameraDevice, ConnectionStatus
 from arcane_eyes.logic.adoption_worker import CameraAdoptionWorker
 from arcane_eyes.logic.stream_manager import StreamManager
+from arcane_eyes.services.cache_service import (
+    CAMERA_CACHE_HEADER,
+    CameraCacheEntry,
+    parse_camera_cache,
+    serialize_camera_cache,
+)
+from arcane_eyes.services.capability_service import CameraCapabilityEnrichmentService
 from arcane_eyes.services.discovery_service import NetworkDiscoveryService
+from arcane_eyes.services.ptz_service import OnvifPTZService
 from arcane_eyes.services.provisioning_service import (
     CameraAdoptionService,
     SetupQrCredentialCache,
@@ -58,75 +65,10 @@ from arcane_eyes.ui.record_dialog import RecordDialog
 APP_ICON_PATH = Path(__file__).resolve().parents[2] / "assets" / "arcane-eye-icon.png"
 FEEDS_PER_PAGE = 4
 CLOCKWISE_GRID_POSITIONS = [(0, 0), (0, 1), (1, 1), (1, 0)]
-CAMERA_CACHE_HEADER = ["id", "ip", "display_name"]
 
 
 def make_app_icon() -> QIcon:
     return QIcon(str(APP_ICON_PATH))
-
-
-@dataclass
-class CameraCacheEntry:
-    id: int
-    ip: str
-    display_name: str
-
-
-def parse_camera_cache(serialized_cache: str) -> list[CameraCacheEntry]:
-    if not serialized_cache.strip():
-        return []
-
-    try:
-        reader = csv.DictReader(StringIO(serialized_cache))
-        if reader.fieldnames != CAMERA_CACHE_HEADER:
-            return []
-
-        entries = []
-        seen_ids = set()
-        seen_ips = set()
-        for row in reader:
-            if set(row.keys()) != set(CAMERA_CACHE_HEADER):
-                return []
-
-            try:
-                camera_id = int((row.get("id") or "").strip())
-            except ValueError:
-                return []
-            if camera_id <= 0 or camera_id in seen_ids:
-                return []
-
-            ip = (row.get("ip") or "").strip()
-            try:
-                ip_address(ip)
-            except ValueError:
-                return []
-            if ip in seen_ips:
-                return []
-
-            display_name = (row.get("display_name") or "").strip()
-            if not display_name:
-                return []
-
-            entries.append(CameraCacheEntry(id=camera_id, ip=ip, display_name=display_name))
-            seen_ids.add(camera_id)
-            seen_ips.add(ip)
-    except csv.Error:
-        return []
-
-    return sorted(entries, key=lambda entry: entry.id)
-
-
-def serialize_camera_cache(entries: list[CameraCacheEntry]) -> str:
-    output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=CAMERA_CACHE_HEADER, lineterminator="\n")
-    writer.writeheader()
-    for entry in sorted(entries, key=lambda camera: camera.id):
-        writer.writerow({
-            "id": entry.id,
-            "ip": entry.ip,
-            "display_name": entry.display_name,
-        })
-    return output.getvalue()
 
 
 def grid_position_for_feed(slot_index: int) -> tuple[int, int]:
@@ -134,25 +76,49 @@ def grid_position_for_feed(slot_index: int) -> tuple[int, int]:
 
 
 class DiscoveryWorkerSignals(QObject):
-    camera_found = pyqtSignal(str)
+    camera_found = pyqtSignal(object)
     finished = pyqtSignal()
     error = pyqtSignal(str)
 
 
 class DiscoveryWorker(QRunnable):
-    def __init__(self, discovery_service: NetworkDiscoveryService, network_range: str):
+    def __init__(self, discovery_service: NetworkDiscoveryService, enrichment_service: CameraCapabilityEnrichmentService, network_range: str):
         super().__init__()
         self.service = discovery_service
+        self.enrichment_service = enrichment_service
         self.network_range = network_range
         self.signals = DiscoveryWorkerSignals()
 
     @pyqtSlot()
     def run(self):
         try:
-            self.service.start_async_scan(self.network_range, self.signals.camera_found.emit)
+            def emit_enriched(ip: str):
+                capability = self.enrichment_service.enrich(ip)
+                self.signals.camera_found.emit((ip, capability))
+
+            self.service.start_async_scan(self.network_range, emit_enriched)
             self.signals.finished.emit()
         except Exception as e:
             self.signals.error.emit(str(e))
+
+
+class CapabilityRefreshSignals(QObject):
+    refreshed = pyqtSignal(object)
+
+
+class CapabilityRefreshWorker(QRunnable):
+    def __init__(self, enrichment_service: CameraCapabilityEnrichmentService, ip: str, username: str = "", password: str = ""):
+        super().__init__()
+        self.enrichment_service = enrichment_service
+        self.ip = ip
+        self.username = username
+        self.password = password
+        self.signals = CapabilityRefreshSignals()
+
+    @pyqtSlot()
+    def run(self):
+        capability = self.enrichment_service.enrich(self.ip, username=self.username, password=self.password)
+        self.signals.refreshed.emit((self.ip, capability))
 
 
 class FeedCard(QFrame):
@@ -211,6 +177,7 @@ class ArcaneEyesMainWindow(QMainWindow):
         self.stream_manager = StreamManager()
         self.stream_service = StreamService(target_width=WIDTH, target_height=HEIGHT)
         self.discovery_service = NetworkDiscoveryService(timeout=SCAN_TIMEOUT)
+        self.enrichment_service = CameraCapabilityEnrichmentService()
         self.adoption_service = CameraAdoptionService(self.discovery_service)
         self.credential_cache = SetupQrCredentialCache()
         self.thread_pool = QThreadPool()
@@ -220,6 +187,7 @@ class ArcaneEyesMainWindow(QMainWindow):
         self.camera_entries = {}
         self.display_widgets = {}
         self.active_record_buttons = {}
+        self.ptz_services = {}
         self.current_page = 0
         self.is_scanning_network = False
         self.add_camera_dialog = None
@@ -300,6 +268,36 @@ class ArcaneEyesMainWindow(QMainWindow):
             child_layout = item.layout()
             if child_layout:
                 self._clear_layout(child_layout)
+
+    def stream_key(self, ip: str, usage: str) -> str:
+        return f"{ip}:{usage}"
+
+    def start_camera_display_stream(self, ip: str, usage: str):
+        device = self.active_devices.get(ip)
+        recorder = self.active_recorders.get(ip)
+        if not device or not recorder:
+            return
+
+        stream_key = self.stream_key(ip, usage)
+        stream_url = device.preview_stream_url if usage == "preview" else device.detail_stream_url
+        self.stream_manager.start_stream(
+            device=device,
+            stream_service=self.stream_service,
+            recorder_service=recorder,
+            on_frame_callback=partial(self.on_frame_received, stream_key),
+            stream_key=stream_key,
+            stream_url=stream_url,
+        )
+
+    def refresh_capability_async(self, entry: CameraCacheEntry):
+        worker = CapabilityRefreshWorker(
+            self.enrichment_service,
+            entry.ip,
+            username=entry.username,
+            password=entry.password,
+        )
+        worker.signals.refreshed.connect(self.on_capability_refreshed)
+        self.thread_pool.start(worker)
 
     def _clear_layout(self, layout):
         while layout.count():
@@ -389,7 +387,9 @@ class ArcaneEyesMainWindow(QMainWindow):
             page_ips = ips[page_start:page_start + FEEDS_PER_PAGE]
             for slot_index, ip in enumerate(page_ips):
                 display_widget = CameraDisplayWidget(ip=ip, show_ptz=False, fixed_size=False)
-                self.display_widgets[ip] = display_widget
+                stream_key = self.stream_key(ip, "preview")
+                self.display_widgets[stream_key] = display_widget
+                self.start_camera_display_stream(ip, "preview")
                 card = FeedCard(ip, self.display_name_for_ip(ip), display_widget, self.open_feed_detail)
                 row, col = grid_position_for_feed(slot_index)
                 feed_layout.addWidget(card, row, col)
@@ -435,7 +435,7 @@ class ArcaneEyesMainWindow(QMainWindow):
             self.show_feed_dashboard()
 
     def show_next_page(self):
-        if self.current_page < (len(self.active_devices) - 1) // FEEDS_PER_PAGE:
+        if self.current_page < (len(self.camera_entries) - 1) // FEEDS_PER_PAGE:
             self.current_page += 1
             self.show_feed_dashboard()
 
@@ -462,8 +462,17 @@ class ArcaneEyesMainWindow(QMainWindow):
         """)
         video_layout = QVBoxLayout(video_panel)
         video_layout.setContentsMargins(10, 10, 10, 10)
-        display_widget = CameraDisplayWidget(ip=ip, show_ptz=True, fixed_size=False)
-        self.display_widgets[ip] = display_widget
+        ptz_service = self.get_ptz_service(ip)
+        display_widget = CameraDisplayWidget(
+            ip=ip,
+            show_ptz=True,
+            fixed_size=False,
+            ptz_service=ptz_service,
+            ptz_supported=ptz_service is not None,
+        )
+        stream_key = self.stream_key(ip, "detail")
+        self.display_widgets[stream_key] = display_widget
+        self.start_camera_display_stream(ip, "detail")
         video_layout.addWidget(display_widget)
 
         controls_panel = self._build_detail_controls(ip)
@@ -471,9 +480,23 @@ class ArcaneEyesMainWindow(QMainWindow):
         detail_row.addWidget(controls_panel)
         self.content_layout.addLayout(detail_row, 1)
 
+    def get_ptz_service(self, ip: str):
+        if ip in self.ptz_services:
+            return self.ptz_services[ip]
+        device = self.active_devices.get(ip)
+        if not device or not device.capability.ptz_supported:
+            return None
+        try:
+            service = OnvifPTZService(ip=ip, user=device.username or "admin", pwd=device.password)
+        except Exception as exc:
+            print(f"PTZ Disabled for {ip}: {exc}")
+            return None
+        self.ptz_services[ip] = service
+        return service
+
     def _build_detail_controls(self, ip: str) -> QWidget:
         panel = QFrame()
-        panel.setFixedWidth(260)
+        panel.setFixedWidth(340)
         panel.setObjectName("controlsPanel")
         panel.setStyleSheet("""
             QFrame#controlsPanel {
@@ -483,8 +506,8 @@ class ArcaneEyesMainWindow(QMainWindow):
             }
         """)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
         record_button = QPushButton("Record")
         record_button.setMinimumHeight(74)
@@ -502,6 +525,26 @@ class ArcaneEyesMainWindow(QMainWindow):
         action_row.addWidget(live_button)
         layout.addLayout(action_row)
 
+        device = self.active_devices[ip]
+        profiles = device.capability.valid_profiles()
+        if profiles:
+            profile_selector = QComboBox()
+            profile_selector.setToolTip("Select the RTSP media profile used by this detail view.")
+            profile_selector.setMinimumHeight(32)
+            profile_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            profile_selector.setMinimumContentsLength(28)
+            for profile in sorted(profiles, key=lambda item: (item.pixels, item.name)):
+                label = profile.label()
+                profile_selector.addItem(label, profile.token)
+                profile_selector.setItemData(profile_selector.count() - 1, label, Qt.ItemDataRole.ToolTipRole)
+            current = device.capability.detail_profile(device.selected_detail_profile)
+            if current:
+                index = profile_selector.findData(current.token)
+                if index >= 0:
+                    profile_selector.setCurrentIndex(index)
+            profile_selector.currentIndexChanged.connect(partial(self.change_detail_profile, ip, profile_selector))
+            layout.addWidget(profile_selector)
+
         controls_title = QLabel("Camera Controls")
         controls_title.setStyleSheet("background: #405468; color: #d7e1ea; font-weight: 700; padding: 8px;")
         layout.addWidget(controls_title)
@@ -516,23 +559,83 @@ class ArcaneEyesMainWindow(QMainWindow):
         details_title = QLabel("Camera Technical Details")
         details_title.setStyleSheet("background: #405468; color: #d7e1ea; font-weight: 700; padding: 8px;")
         layout.addWidget(details_title)
-        device = self.active_devices[ip]
+        detail_profile = device.capability.detail_profile(device.selected_detail_profile)
+        video = detail_profile.video if detail_profile else None
+        audio = detail_profile.audio if detail_profile else None
+        device_info = device.capability.device_info
         details = {
             "Name": self.display_name_for_ip(ip),
             "IP Address": ip,
-            "Resolution": f"{WIDTH}x{HEIGHT}",
+            "ONVIF": self._format_device_identity(device_info),
+            "Profile": detail_profile.name if detail_profile else "Fallback RTSP",
+            "Resolution": f"{detail_profile.width}x{detail_profile.height}" if detail_profile and detail_profile.width else f"{WIDTH}x{HEIGHT}",
+            "Video": video.codec if video and video.codec else "Unknown",
+            "FPS": str(video.fps) if video and video.fps else "Unknown",
+            "Audio": audio.codec if audio and audio.codec else "Unavailable",
+            "Recording Audio": self._format_recording_audio_mode(device.capability.recording_audio_mode),
+            "PTZ": "Available" if device.capability.ptz_supported else "Unavailable",
             "Status": device.status.name.title(),
         }
         for label, value in details.items():
-            row = QHBoxLayout()
-            row.addWidget(QLabel(f"{label}:"))
-            value_label = QLabel(value)
-            value_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-            row.addWidget(value_label)
-            layout.addLayout(row)
+            layout.addLayout(self._make_detail_row(label, value))
+
+        if device.capability.warnings:
+            warnings = "\n".join(device.capability.warnings[:4])
+            warning_label = QLabel(warnings)
+            warning_label.setWordWrap(True)
+            warning_label.setToolTip("\n".join(device.capability.warnings))
+            warning_label.setStyleSheet("color: #e4c069;")
+            layout.addWidget(warning_label)
 
         layout.addStretch(1)
         return panel
+
+    def _make_detail_row(self, label: str, value: str) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        label_widget = QLabel(f"{label}:")
+        label_widget.setFixedWidth(124)
+        label_widget.setToolTip(label)
+        label_widget.setStyleSheet("background: #152331; padding: 4px;")
+
+        value_label = QLabel(value)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        value_label.setToolTip(value)
+        value_label.setMinimumWidth(0)
+        value_label.setStyleSheet("background: #152331; padding: 4px;")
+        value_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        row.addWidget(label_widget)
+        row.addWidget(value_label, 1)
+        return row
+
+    def _format_device_identity(self, info: dict) -> str:
+        manufacturer = info.get("manufacturer") or "Unknown"
+        model = info.get("model") or ""
+        return f"{manufacturer} {model}".strip()
+
+    def _format_recording_audio_mode(self, mode: str) -> str:
+        if mode == "rtsp":
+            return "RTSP"
+        if mode == "legacy_tcp":
+            return "Legacy TCP"
+        return "Unknown"
+
+    def change_detail_profile(self, ip: str, selector: QComboBox, _index: int):
+        token = selector.currentData()
+        if not token:
+            return
+        device = self.active_devices.get(ip)
+        entry = self.camera_entries.get(ip)
+        if not device or not entry:
+            return
+        device.selected_detail_profile = token
+        entry.selected_detail_profile = token
+        self.stream_manager.stop_stream(self.stream_key(ip, "detail"))
+        self.start_camera_display_stream(ip, "detail")
+        self.save_cached_cameras()
 
     def show_settings_screen(self):
         self._clear_content()
@@ -558,7 +661,7 @@ class ArcaneEyesMainWindow(QMainWindow):
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(8)
 
-        headers = ["ID", "IP Address", "Display Name", "Status", "Order", ""]
+        headers = ["ID", "IP Address", "Display Name", "Username", "Password", "Status", "Order", ""]
         for col, header in enumerate(headers):
             label = QLabel(header)
             label.setStyleSheet("font-weight: 700; color: #d7e1ea;")
@@ -574,6 +677,9 @@ class ArcaneEyesMainWindow(QMainWindow):
                 id_label = QLabel(str(entry.id))
                 ip_input = QLineEdit(entry.ip)
                 name_input = QLineEdit(entry.display_name)
+                username_input = QLineEdit(entry.username)
+                password_input = QLineEdit(entry.password)
+                password_input.setEchoMode(QLineEdit.EchoMode.Password)
                 status = self.active_devices.get(entry.ip)
                 status_label = QLabel(status.status.name.title() if status else "Disconnected")
 
@@ -591,14 +697,23 @@ class ArcaneEyesMainWindow(QMainWindow):
                 order_row.addWidget(down_button)
 
                 save_button = QPushButton("Save")
-                save_button.clicked.connect(partial(self.save_camera_settings, entry.ip, ip_input, name_input))
+                save_button.clicked.connect(partial(
+                    self.save_camera_settings,
+                    entry.ip,
+                    ip_input,
+                    name_input,
+                    username_input,
+                    password_input,
+                ))
 
                 layout.addWidget(id_label, row, 0)
                 layout.addWidget(ip_input, row, 1)
                 layout.addWidget(name_input, row, 2)
-                layout.addWidget(status_label, row, 3)
-                layout.addLayout(order_row, row, 4)
-                layout.addWidget(save_button, row, 5)
+                layout.addWidget(username_input, row, 3)
+                layout.addWidget(password_input, row, 4)
+                layout.addWidget(status_label, row, 5)
+                layout.addLayout(order_row, row, 6)
+                layout.addWidget(save_button, row, 7)
 
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(2, 1)
@@ -660,9 +775,18 @@ class ArcaneEyesMainWindow(QMainWindow):
         layout.addStretch(1)
         return container
 
-    def save_camera_settings(self, old_ip: str, ip_input: QLineEdit, name_input: QLineEdit):
+    def save_camera_settings(
+        self,
+        old_ip: str,
+        ip_input: QLineEdit,
+        name_input: QLineEdit,
+        username_input: QLineEdit,
+        password_input: QLineEdit,
+    ):
         new_ip = ip_input.text().strip()
         display_name = name_input.text().strip()
+        username = username_input.text().strip()
+        password = password_input.text()
 
         try:
             ip_address(new_ip)
@@ -682,36 +806,42 @@ class ArcaneEyesMainWindow(QMainWindow):
 
         if new_ip == old_ip:
             entry.display_name = display_name
+            entry.username = username
+            entry.password = password
             device = self.active_devices.get(old_ip)
             if device:
                 device.name = display_name
+                device.username = username
+                device.password = password
             self.save_cached_cameras()
+            self.refresh_capability_async(entry)
             self.show_settings_screen()
             return
 
         self.stop_camera_stream(old_ip)
         device = self.active_devices.pop(old_ip, CameraDevice(ip=new_ip, status=ConnectionStatus.CONNECTING))
         recorder = self.active_recorders.pop(old_ip, PyAVRecorderService())
-        self.display_widgets.pop(old_ip, None)
+        self.display_widgets.pop(self.stream_key(old_ip, "preview"), None)
+        self.display_widgets.pop(self.stream_key(old_ip, "detail"), None)
         self.active_record_buttons.pop(old_ip, None)
+        self.ptz_services.pop(old_ip, None)
 
         entry.ip = new_ip
         entry.display_name = display_name
+        entry.username = username
+        entry.password = password
         self.camera_entries.pop(old_ip, None)
         self.camera_entries[new_ip] = entry
 
         device.ip = new_ip
         device.name = display_name
+        device.username = username
+        device.password = password
         device.status = ConnectionStatus.CONNECTING
         self.active_devices[new_ip] = device
         self.active_recorders[new_ip] = recorder
-        self.stream_manager.start_stream(
-            device=device,
-            stream_service=self.stream_service,
-            recorder_service=recorder,
-            on_frame_callback=partial(self.on_frame_received, new_ip),
-        )
         self.save_cached_cameras()
+        self.refresh_capability_async(entry)
         self.show_settings_screen()
 
     def move_camera_entry(self, ip: str, direction: int):
@@ -833,15 +963,16 @@ class ArcaneEyesMainWindow(QMainWindow):
         if not self.active_devices:
             self.show_feed_dashboard()
 
-        worker = DiscoveryWorker(self.discovery_service, network_range)
+        worker = DiscoveryWorker(self.discovery_service, self.enrichment_service, network_range)
         worker.signals.camera_found.connect(self.on_camera_discovered)
         worker.signals.finished.connect(self.on_scan_finished)
         worker.signals.error.connect(self.on_scan_error)
 
         self.thread_pool.start(worker)
 
-    def on_camera_discovered(self, ip: str):
-        self.add_camera(ip)
+    def on_camera_discovered(self, discovered):
+        ip, capability = discovered if isinstance(discovered, tuple) else (discovered, CameraCapability())
+        self.add_camera(ip, capability=capability)
 
     def on_scan_finished(self):
         self.is_scanning_network = False
@@ -924,39 +1055,80 @@ class ArcaneEyesMainWindow(QMainWindow):
 
     def stop_camera_stream(self, ip: str):
         if hasattr(self.stream_manager, "stop_stream"):
-            self.stream_manager.stop_stream(ip)
+            self.stream_manager.stop_stream(self.stream_key(ip, "preview"))
+            self.stream_manager.stop_stream(self.stream_key(ip, "detail"))
 
-    def add_camera(self, ip: str, persist: bool = True, cache_entry: CameraCacheEntry | None = None):
+    def add_camera(
+        self,
+        ip: str,
+        persist: bool = True,
+        cache_entry: CameraCacheEntry | None = None,
+        capability: CameraCapability | None = None,
+    ):
         if ip in self.active_devices:
+            if capability:
+                self.on_capability_refreshed((ip, capability))
             return
 
         entry = cache_entry or self.camera_entries.get(ip)
         if not entry:
             entry = CameraCacheEntry(id=self.next_camera_cache_id(), ip=ip, display_name=ip)
+        if capability:
+            entry.capability = capability
         self.camera_entries[ip] = entry
 
-        device = CameraDevice(ip=ip, name=entry.display_name, status=ConnectionStatus.CONNECTING)
+        device = CameraDevice(
+            ip=ip,
+            name=entry.display_name,
+            username=entry.username,
+            password=entry.password,
+            status=ConnectionStatus.CONNECTING,
+            capability=entry.capability,
+            selected_preview_profile=entry.selected_preview_profile,
+            selected_detail_profile=entry.selected_detail_profile,
+        )
         recorder_service = PyAVRecorderService()
 
         self.active_devices[ip] = device
         self.active_recorders[ip] = recorder_service
 
-        self.stream_manager.start_stream(
-            device=device,
-            stream_service=self.stream_service,
-            recorder_service=recorder_service,
-            on_frame_callback=partial(self.on_frame_received, ip),
-        )
+        if entry.capability.stale:
+            self.refresh_capability_async(entry)
         if persist:
             self.save_cached_cameras()
             self.show_feed_dashboard()
 
-    def on_frame_received(self, ip: str, stream_frame):
+    def on_capability_refreshed(self, refreshed):
+        ip, capability = refreshed
+        entry = self.camera_entries.get(ip)
+        device = self.active_devices.get(ip)
+        if entry:
+            entry.capability = capability
+            if not entry.selected_preview_profile:
+                preview = capability.preview_profile()
+                entry.selected_preview_profile = preview.token if preview else ""
+            if not entry.selected_detail_profile:
+                detail = capability.detail_profile()
+                entry.selected_detail_profile = detail.token if detail else ""
+        if device:
+            device.capability = capability
+            if entry:
+                device.selected_preview_profile = entry.selected_preview_profile
+                device.selected_detail_profile = entry.selected_detail_profile
+        for usage in ("preview", "detail"):
+            stream_key = self.stream_key(ip, usage)
+            if stream_key in self.display_widgets:
+                self.stream_manager.stop_stream(stream_key)
+                self.start_camera_display_stream(ip, usage)
+        self.save_cached_cameras()
+
+    def on_frame_received(self, stream_key: str, stream_frame):
+        ip = stream_key.split(":", 1)[0]
         device = self.active_devices.get(ip)
         if device:
             device.status = ConnectionStatus.CONNECTED
 
-        display_widget = self.display_widgets.get(ip)
+        display_widget = self.display_widgets.get(stream_key)
         if display_widget:
             rgb_data = self.stream_service.convert_for_ui(stream_frame.data)
             h, w, ch = rgb_data.shape
@@ -992,9 +1164,10 @@ class ArcaneEyesMainWindow(QMainWindow):
 
             if recorder and device:
                 recorder.start(
-                    rtsp_url=device.rtsp_url,
+                    rtsp_url=device.recording_stream_url,
                     output_path=request.output_path,
                     duration_minutes=request.duration_minutes,
+                    use_rtsp_audio=device.recording_uses_rtsp_audio,
                 )
 
     def keyPressEvent(self, event: QKeyEvent):

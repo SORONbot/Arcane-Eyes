@@ -23,31 +23,42 @@ class PyAVRecorderService(IVideoRecorder):
         # Cross-thread communication flag
         self._video_ready_event = threading.Event()
 
-    def start(self, rtsp_url: str, output_path: str, duration_minutes: int) -> None:
+    def start(self, rtsp_url: str, output_path: str, duration_minutes: int, use_rtsp_audio: bool = False) -> None:
         try:
             with self._lock:
                 from arcane_eyes.core.config import RTSP_OPTIONS, AUDIO_PORT, AUDIO_FORMAT, AUDIO_OPTIONS
 
                 parsed_url = urlparse(rtsp_url)
                 ip = parsed_url.hostname
-                audio_url = f"tcp://{ip}:{AUDIO_PORT}"
 
                 video_input = av.open(rtsp_url, options=RTSP_OPTIONS)
-                audio_input = av.open(audio_url, format=AUDIO_FORMAT, options=AUDIO_OPTIONS)
                 self._output_container = av.open(output_path, mode='w')
 
                 in_video = video_input.streams.video[0]
                 self._out_video = self._output_container.add_stream_from_template(in_video)
 
-                in_audio = audio_input.streams.audio[0]
-                self._out_audio = self._output_container.add_stream('aac', rate=int(AUDIO_OPTIONS['ar']))
+                audio_input = None
+                in_audio = None
+                if use_rtsp_audio and video_input.streams.audio:
+                    audio_input = video_input
+                    in_audio = video_input.streams.audio[0]
+                    self._out_audio = self._output_container.add_stream('aac', rate=in_audio.codec_context.sample_rate or int(AUDIO_OPTIONS['ar']))
+                else:
+                    audio_url = f"tcp://{ip}:{AUDIO_PORT}"
+                    audio_input = av.open(audio_url, format=AUDIO_FORMAT, options=AUDIO_OPTIONS)
+                    in_audio = audio_input.streams.audio[0]
+                    self._out_audio = self._output_container.add_stream('aac', rate=int(AUDIO_OPTIONS['ar']))
 
                 self._is_recording = True
                 self._end_time = time.time() + (duration_minutes * 60)
                 self._video_ready_event.clear()
 
-            threading.Thread(target=self._video_reader, args=(video_input,), daemon=True).start()
-            threading.Thread(target=self._audio_reader, args=(audio_input, in_audio), daemon=True).start()
+            if use_rtsp_audio and in_audio:
+                threading.Thread(target=self._rtsp_av_reader, args=(video_input, in_video, in_audio), daemon=True).start()
+            else:
+                threading.Thread(target=self._video_reader, args=(video_input,), daemon=True).start()
+                if in_audio:
+                    threading.Thread(target=self._audio_reader, args=(audio_input, in_audio), daemon=True).start()
             threading.Thread(target=self._muxer_loop, daemon=True).start()
 
         except Exception as e:
@@ -80,6 +91,41 @@ class PyAVRecorderService(IVideoRecorder):
                     packet.dts -= start_dts
 
                 self._packet_queue.put(('video', packet))
+        finally:
+            container.close()
+
+    def _rtsp_av_reader(self, container, video_stream, audio_stream):
+        try:
+            first_keyframe_found = False
+            start_pts = None
+            start_dts = None
+
+            for packet in container.demux(video_stream, audio_stream):
+                if not self._is_recording:
+                    break
+
+                if packet.stream.type == "video":
+                    if packet.dts is None:
+                        continue
+                    if not first_keyframe_found:
+                        if packet.is_keyframe:
+                            first_keyframe_found = True
+                            start_pts = packet.pts
+                            start_dts = packet.dts
+                            self._video_ready_event.set()
+                        else:
+                            continue
+                    if packet.pts is not None and start_pts is not None:
+                        packet.pts -= start_pts
+                    if packet.dts is not None and start_dts is not None:
+                        packet.dts -= start_dts
+                    self._packet_queue.put(('video', packet))
+                    continue
+
+                if packet.stream.type == "audio" and first_keyframe_found:
+                    for frame in packet.decode():
+                        for aac_packet in self._out_audio.encode(frame):
+                            self._packet_queue.put(('audio', aac_packet))
         finally:
             container.close()
 

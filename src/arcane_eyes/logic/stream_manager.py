@@ -13,20 +13,21 @@ class StreamManager:
         self.thread_pool = QThreadPool()
         self.active_workers: Dict[str, CameraWorker] = {}
 
-    def start_stream(self, device, stream_service, recorder_service, on_frame_callback):
+    def start_stream(self, device, stream_service, recorder_service, on_frame_callback, stream_key: str | None = None, stream_url: str | None = None):
         """Initializes and starts a worker for a specific camera."""
-        if device.ip in self.active_workers:
+        key = stream_key or device.ip
+        if key in self.active_workers:
             return
 
-        worker = CameraWorker(device, stream_service, recorder_service)
+        worker = CameraWorker(device, stream_service, recorder_service, stream_url or device.rtsp_url)
         worker.signals.frame_ready.connect(on_frame_callback)
 
-        self.active_workers[device.ip] = worker
+        self.active_workers[key] = worker
         self.thread_pool.start(worker)
 
-    def stop_stream(self, ip: str):
+    def stop_stream(self, stream_key: str):
         """Gracefully stop a single camera worker."""
-        worker = self.active_workers.pop(ip, None)
+        worker = self.active_workers.pop(stream_key, None)
         if worker:
             worker.stop()
 

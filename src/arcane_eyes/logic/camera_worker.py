@@ -16,17 +16,18 @@ class CameraWorker(QRunnable):
     Focuses on the high-speed capture loop and dispatches frames to services.
     """
 
-    def __init__(self, camera_device, stream_service, recorder_service):
+    def __init__(self, camera_device, stream_service, recorder_service, stream_url: str):
         super().__init__()
         self.device = camera_device
         self.stream_service = stream_service
         self.recorder_service = recorder_service
+        self.stream_url = stream_url
         self.signals = WorkerSignals()
         self._is_running = True
 
     @pyqtSlot()
     def run(self):
-        cap = cv2.VideoCapture(self.device.rtsp_url)
+        cap = cv2.VideoCapture(self.stream_url)
 
         try:
             while self._is_running:

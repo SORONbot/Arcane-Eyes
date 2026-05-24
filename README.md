@@ -1,39 +1,55 @@
-# 👁️ Arcane Eyes
+# Arcane Eyes
 
-A service-oriented IP camera management application. Arcane Eyes provides high-performance RTSP streaming, PTZ (Pan-Tilt-Zoom) control via ONVIF, and dual-stream A/V recording.
+Arcane Eyes is a desktop IP camera manager built around RTSP and ONVIF. It discovers cameras on the local network, shows live feeds, exposes PTZ controls when available, and records video with audio-aware stream handling.
 
-Arcane Eyes is designed to replace fragmented, proprietary software suites with a unified, open-source platform for managing commercial and consumer-grade IP cameras. 
-By leveraging standard protocols and common network configurations, the application provides a centralized control panel to monitor live feeds, execute synchronized recordings, and manage Pan-Tilt-Zoom (PTZ) hardware across all discovered devices. 
+The goal is to provide one simple control panel for cameras that otherwise depend on fragmented vendor tools.
 
-## 🚀 Key Features
-* **Live Discovery**: Async network scanning that populates your UI the moment a camera is found.
-* **Smart Caching**: Remembers your cameras in `.eye_cache` to skip scanning on next launch.
-* **Clean Recordings**: Wait-for-keyframe logic and PTS rebasing to prevent green smearing in MP4s.
-* **Dual-Stream Audio**: Captures video via RTSP and synchronized raw audio via TCP/8001.
+## Features
 
-## 🛠️ Installation & Setup
+- **Network discovery**: Scans a configured network range and adds cameras as they are found.
+- **ONVIF capability probing**: Reads device info, media profiles, stream URIs, PTZ availability, and service warnings when ONVIF is available.
+- **Validated stream profiles**: Probes RTSP streams with PyAV/FFmpeg and trusts the actual media tracks over loose ONVIF metadata.
+- **Smart profile selection**: Uses lower-resolution streams for the multi-feed dashboard and higher-resolution streams for Feed Details and recording.
+- **Feed Details view**: Shows stream profiles, codec/resolution/audio details, ONVIF identity, PTZ state, and probe warnings.
+- **PTZ controls**: Uses ONVIF PTZ when the camera reports usable support.
+- **Recording**: Prefers audio embedded in the selected RTSP stream and falls back to the legacy TCP audio path only when needed.
+- **CSV cache**: Stores cameras, credentials, selected profiles, and capability metadata in `.eye_cache`.
 
-This project uses **uv** for ultra-fast dependency management and building.
+## Setup
 
-1. **Clone and Install:**
-   ```bash
-   uv pip install -e .
-   ```
+This project uses `uv`.
 
-2. **Run With:**
-    ```bash
-    arcane-eyes
-    ```
----
+```bash
+uv pip install -e .
+arcane-eyes
+```
 
-## Tested With the Following Cameras:
-- 2 TG1/YQC13/DF2427196
+Common environment settings:
 
-## Next Steps
+```bash
+SCAN_RANGE=192.168.100.0/24
+RTSP_TRANSPORT=tcp
+ONVIF_DEFAULT_USER=admin
+ONVIF_DEFAULT_PASSWORD=
+ONVIF_PORT=80
+```
 
-- Proper Control Panel
-- Better layout management for multiple cameras (4+)
-- Proper Setup Sequence for New Cameras
-- Support for modifying internal configurations for cameras
+See `.env.example` for the full list.
 
-- PTZ support for cameras that do not use ONVIF
+## Cache
+
+`.eye_cache` remains a CSV file. Older three-column cache files are migrated automatically the next time the app saves cameras.
+
+Newer cache rows include ONVIF capability metadata as JSON inside a CSV cell. If that metadata is missing or malformed, the app keeps the camera row and re-probes capabilities.
+
+## Tested Cameras
+
+- TG1/YQC13/DF2427196 family cameras
+
+These cameras expose TAS/Ginatex-style RTSP behavior and ONVIF media profiles. The implementation is intended to stay brand-agnostic, so unsupported or partial ONVIF behavior should appear as warnings rather than hard failures.
+
+## Current Limitations
+
+- ONVIF camera configuration is read-only for now.
+- Non-ONVIF PTZ is not implemented.
+- Some vendor-specific controls such as night vision, motion detection, and IR settings are displayed as unavailable until a standard or vendor-specific control path is added.

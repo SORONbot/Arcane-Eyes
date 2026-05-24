@@ -15,8 +15,8 @@ class FakeStreamManager:
         self.started_ips = []
         self.stopped_ips = []
 
-    def start_stream(self, device, stream_service, recorder_service, on_frame_callback):
-        self.started_ips.append(device.ip)
+    def start_stream(self, device, stream_service, recorder_service, on_frame_callback, stream_key=None, stream_url=None):
+        self.started_ips.append(stream_key or device.ip)
 
     def stop_stream(self, ip):
         self.stopped_ips.append(ip)
@@ -35,6 +35,13 @@ class FakeDiscoveryService:
         self.started_scans.append(network_range)
 
 
+class FakeCapabilityEnrichmentService:
+    def enrich(self, ip, username="", password="", port=554):
+        from arcane_eyes.core.models import CameraCapability
+
+        return CameraCapability(stale=False)
+
+
 def install_dashboard_fakes(monkeypatch, tmp_path, cache_text=None):
     cache_path = tmp_path / ".eye_cache"
     if cache_text is not None:
@@ -44,6 +51,7 @@ def install_dashboard_fakes(monkeypatch, tmp_path, cache_text=None):
     monkeypatch.setattr(main_module, "CACHE_FILE_PATH", cache_path)
     monkeypatch.setattr(main_module, "StreamManager", FakeStreamManager)
     monkeypatch.setattr(main_module, "NetworkDiscoveryService", FakeDiscoveryService)
+    monkeypatch.setattr(main_module, "CameraCapabilityEnrichmentService", FakeCapabilityEnrichmentService)
     monkeypatch.setattr(CameraDisplayWidget, "_init_ptz", lambda self: None)
 
 
@@ -96,7 +104,11 @@ def test_cached_startup_restores_sorted_feeds_directly(qtbot, monkeypatch, tmp_p
     qtbot.addWidget(window)
 
     assert window.sorted_camera_ips() == ["192.168.100.10", "192.168.100.2", "10.0.0.1"]
-    assert window.stream_manager.started_ips == ["192.168.100.10", "192.168.100.2", "10.0.0.1"]
+    assert window.stream_manager.started_ips == [
+        "192.168.100.10:preview",
+        "192.168.100.2:preview",
+        "10.0.0.1:preview",
+    ]
     assert FakeDiscoveryService.started_scans == []
 
 
@@ -138,6 +150,8 @@ def test_editing_display_name_updates_cache_and_feed_label(qtbot, monkeypatch, t
         "192.168.100.20",
         QLineEdit("192.168.100.20"),
         QLineEdit("Porch"),
+        QLineEdit(""),
+        QLineEdit(""),
     )
     window.show_feed_dashboard()
 
@@ -154,10 +168,11 @@ def test_editing_ip_restarts_stream_for_new_ip(qtbot, monkeypatch, tmp_path):
         "192.168.100.20",
         QLineEdit("192.168.100.21"),
         QLineEdit("Front Door"),
+        QLineEdit(""),
+        QLineEdit(""),
     )
 
-    assert window.stream_manager.stopped_ips == ["192.168.100.20"]
-    assert window.stream_manager.started_ips[-1] == "192.168.100.21"
+    assert window.stream_manager.stopped_ips == ["192.168.100.20:preview", "192.168.100.20:detail"]
     assert window.sorted_camera_ips() == ["192.168.100.21"]
 
 

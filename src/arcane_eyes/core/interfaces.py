@@ -54,7 +54,7 @@ class IVideoRecorder(ABC):
     """Interface for managing video recording tasks."""
 
     @abstractmethod
-    def start(self, rtsp_url: str, output_path: str, duration_minutes: int) -> None:
+    def start(self, rtsp_url: str, output_path: str, duration_minutes: int, use_rtsp_audio: bool = False) -> None:
         """
         Initialize and start the recording process.
         Requires the rtsp_url to open the stream via PyAV or other backends.
