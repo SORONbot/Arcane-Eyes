@@ -4,7 +4,6 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QSizePoli
 
 from arcane_eyes.core.constants import WIDTH, HEIGHT, STYLE_PTZ_BTN
 from arcane_eyes.core.exceptions import PTZError
-from arcane_eyes.services.ptz_service import OnvifPTZService
 
 
 class VideoLabel(QLabel):
@@ -41,27 +40,16 @@ class CameraDisplayWidget(QWidget):
     """
     UI Component for displaying a single camera feed and its PTZ controls.
     """
-    def __init__(self, ip: str, parent=None, show_ptz: bool = True, fixed_size: bool = False):
+    def __init__(self, ip: str, parent=None, show_ptz: bool = True, fixed_size: bool = False, ptz_service=None, ptz_supported: bool = False):
         super().__init__(parent)
         self.ip = ip
         self.show_ptz = show_ptz
         self.fixed_size = fixed_size
-        self.ptz_service = None
-        self.ptz_supported = False
+        self.ptz_service = ptz_service
+        self.ptz_supported = ptz_supported and ptz_service is not None
         self.ptz_buttons = []
 
-        if self.show_ptz:
-            self._init_ptz()
         self._setup_ui()
-
-    def _init_ptz(self):
-        """Attempts to initialize the hardware PTZ service."""
-        try:
-            self.ptz_service = OnvifPTZService(ip=self.ip)
-            self.ptz_supported = True
-        except PTZError as e:
-            # Camera does not support ONVIF/PTZ or wrong credentials
-            print(f"PTZ Disabled for {self.ip}: {e}")
 
     def _setup_ui(self):
         self.layout = QVBoxLayout(self)

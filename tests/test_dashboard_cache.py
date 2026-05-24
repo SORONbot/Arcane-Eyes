@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 from arcane_eyes.main import (
     CameraCacheEntry,
     grid_position_for_feed,
@@ -63,3 +64,81 @@ def test_clockwise_grid_slot_mapping():
         (1, 1),
         (1, 0),
     ]
+=======
+import json
+from csv import DictWriter
+from io import StringIO
+
+from arcane_eyes.services.cache_service import CAMERA_CACHE_HEADER, parse_camera_cache, serialize_camera_cache
+
+
+def test_empty_cache_returns_empty_list():
+    assert parse_camera_cache("") == []
+
+
+def test_legacy_cache_migrates_to_current_format():
+    entries = parse_camera_cache("id,ip,display_name\n1,192.168.100.25,Gate\n")
+
+    assert len(entries) == 1
+    assert entries[0].ip == "192.168.100.25"
+    assert entries[0].capability.stale is True
+
+    serialized = serialize_camera_cache(entries)
+    assert serialized.splitlines()[0] == ",".join(CAMERA_CACHE_HEADER)
+
+
+def test_current_cache_with_valid_capability_json_round_trips():
+    capability = {
+        "device_info": {"manufacturer": "EYEPLUS"},
+        "profiles": [
+            {
+                "token": "Profile_1",
+                "name": "mainStream",
+                "uri": "rtsp://192.168.100.25:554/0/av0",
+                "valid": True,
+                "video": {"kind": "video", "codec": "hevc", "width": 1920, "height": 1080},
+                "audio": {"kind": "audio", "codec": "pcm_alaw"},
+            }
+        ],
+        "ptz_supported": True,
+        "stale": False,
+    }
+    buffer = StringIO()
+    writer = DictWriter(buffer, fieldnames=CAMERA_CACHE_HEADER, lineterminator="\n")
+    writer.writeheader()
+    writer.writerow({
+        "id": 1,
+        "ip": "192.168.100.25",
+        "display_name": "Gate",
+        "username": "",
+        "password": "",
+        "capability_json": json.dumps(capability),
+        "selected_preview_profile": "",
+        "selected_detail_profile": "",
+        "cache_version": "2",
+        "updated_at": "",
+    })
+
+    entries = parse_camera_cache(buffer.getvalue())
+
+    assert len(entries) == 1
+    assert entries[0].capability.device_info["manufacturer"] == "EYEPLUS"
+    assert entries[0].capability.valid_profiles()[0].video.codec == "hevc"
+
+
+def test_malformed_capability_json_marks_row_stale():
+    row = ",".join(CAMERA_CACHE_HEADER) + "\n"
+    row += '1,192.168.100.25,Gate,,,not-json,,,,\n'
+
+    entries = parse_camera_cache(row)
+
+    assert len(entries) == 1
+    assert entries[0].capability.stale is True
+    assert entries[0].capability.warnings
+
+
+def test_duplicate_ips_rejected():
+    serialized = "id,ip,display_name\n1,192.168.100.25,Gate\n2,192.168.100.25,Gate 2\n"
+
+    assert parse_camera_cache(serialized) == []
+>>>>>>> 890d149 (ONVIF Enhanced Camera Probing)

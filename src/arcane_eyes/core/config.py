@@ -17,6 +17,11 @@ DEFAULT_SCAN_RANGE = os.getenv("SCAN_RANGE", "192.168.100.0/24")
 RTSP_TRANSPORT_TYPE = os.getenv("RTSP_TRANSPORT", "tcp")
 RTSP_TIMEOUT = os.getenv("RTSP_TIMEOUT", "5000000") # microseconds
 
+# ONVIF
+ONVIF_DEFAULT_USER = os.getenv("ONVIF_DEFAULT_USER", "admin")
+ONVIF_DEFAULT_PASSWORD = os.getenv("ONVIF_DEFAULT_PASSWORD", "")
+ONVIF_PORT = int(os.getenv("ONVIF_PORT", "80"))
+
 # Audio Settings
 AUDIO_PORT = int(os.getenv("AUDIO_PORT", 8001))
 AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "mulaw")
