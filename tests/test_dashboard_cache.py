@@ -1,7 +1,12 @@
-<<<<<<< HEAD
-from arcane_eyes.main import (
+import json
+from csv import DictReader, DictWriter
+from io import StringIO
+
+from arcane_eyes.main import grid_position_for_feed
+from arcane_eyes.services.cache_service import (
+    CACHE_VERSION,
+    CAMERA_CACHE_HEADER,
     CameraCacheEntry,
-    grid_position_for_feed,
     parse_camera_cache,
     serialize_camera_cache,
 )
@@ -17,7 +22,7 @@ def test_parse_camera_cache_treats_missing_header_as_corrupted():
     assert parse_camera_cache("ip,display_name\n192.168.100.10,Front Door\n") == []
 
 
-def test_parse_camera_cache_treats_invalid_rows_as_corrupted():
+def test_parse_camera_cache_treats_invalid_legacy_rows_as_corrupted():
     assert parse_camera_cache("id,ip,display_name\nx,192.168.100.10,Front Door\n") == []
     assert parse_camera_cache("id,ip,display_name\n0,192.168.100.10,Front Door\n") == []
     assert parse_camera_cache("id,ip,display_name\n1,not-an-ip,Front Door\n") == []
@@ -33,58 +38,30 @@ def test_parse_camera_cache_treats_duplicate_ids_or_ips_as_corrupted():
     ) == []
 
 
-def test_parse_camera_cache_loads_valid_csv_ordered_by_id():
+def test_legacy_cache_migrates_to_current_entry_shape_ordered_by_id():
     entries = parse_camera_cache(
         "id,ip,display_name\n2,192.168.100.25,Living Room\n1,192.168.100.24,Front Door\n"
     )
 
-    assert entries == [
-        CameraCacheEntry(id=1, ip="192.168.100.24", display_name="Front Door"),
-        CameraCacheEntry(id=2, ip="192.168.100.25", display_name="Living Room"),
+    assert [(entry.id, entry.ip, entry.display_name) for entry in entries] == [
+        (1, "192.168.100.24", "Front Door"),
+        (2, "192.168.100.25", "Living Room"),
     ]
+    assert all(entry.capability.stale for entry in entries)
 
 
-def test_serialize_camera_cache_writes_required_header_ordered_by_id():
+def test_serialize_camera_cache_writes_current_header_ordered_by_id():
     serialized = serialize_camera_cache([
         CameraCacheEntry(id=2, ip="192.168.100.25", display_name="Living Room"),
         CameraCacheEntry(id=1, ip="192.168.100.24", display_name="Front Door"),
     ])
+    reader = DictReader(StringIO(serialized))
 
-    assert serialized == (
-        "id,ip,display_name\n"
-        "1,192.168.100.24,Front Door\n"
-        "2,192.168.100.25,Living Room\n"
-    )
-
-
-def test_clockwise_grid_slot_mapping():
-    assert [grid_position_for_feed(index) for index in range(4)] == [
-        (0, 0),
-        (0, 1),
-        (1, 1),
-        (1, 0),
-    ]
-=======
-import json
-from csv import DictWriter
-from io import StringIO
-
-from arcane_eyes.services.cache_service import CAMERA_CACHE_HEADER, parse_camera_cache, serialize_camera_cache
-
-
-def test_empty_cache_returns_empty_list():
-    assert parse_camera_cache("") == []
-
-
-def test_legacy_cache_migrates_to_current_format():
-    entries = parse_camera_cache("id,ip,display_name\n1,192.168.100.25,Gate\n")
-
-    assert len(entries) == 1
-    assert entries[0].ip == "192.168.100.25"
-    assert entries[0].capability.stale is True
-
-    serialized = serialize_camera_cache(entries)
-    assert serialized.splitlines()[0] == ",".join(CAMERA_CACHE_HEADER)
+    assert reader.fieldnames == CAMERA_CACHE_HEADER
+    rows = list(reader)
+    assert [row["id"] for row in rows] == ["1", "2"]
+    assert [row["ip"] for row in rows] == ["192.168.100.24", "192.168.100.25"]
+    assert all(row["cache_version"] == CACHE_VERSION for row in rows)
 
 
 def test_current_cache_with_valid_capability_json_round_trips():
@@ -110,11 +87,11 @@ def test_current_cache_with_valid_capability_json_round_trips():
         "id": 1,
         "ip": "192.168.100.25",
         "display_name": "Gate",
-        "username": "",
+        "username": "admin",
         "password": "",
         "capability_json": json.dumps(capability),
-        "selected_preview_profile": "",
-        "selected_detail_profile": "",
+        "selected_preview_profile": "Profile_1",
+        "selected_detail_profile": "Profile_1",
         "cache_version": "2",
         "updated_at": "",
     })
@@ -122,6 +99,8 @@ def test_current_cache_with_valid_capability_json_round_trips():
     entries = parse_camera_cache(buffer.getvalue())
 
     assert len(entries) == 1
+    assert entries[0].username == "admin"
+    assert entries[0].selected_preview_profile == "Profile_1"
     assert entries[0].capability.device_info["manufacturer"] == "EYEPLUS"
     assert entries[0].capability.valid_profiles()[0].video.codec == "hevc"
 
@@ -137,8 +116,10 @@ def test_malformed_capability_json_marks_row_stale():
     assert entries[0].capability.warnings
 
 
-def test_duplicate_ips_rejected():
-    serialized = "id,ip,display_name\n1,192.168.100.25,Gate\n2,192.168.100.25,Gate 2\n"
-
-    assert parse_camera_cache(serialized) == []
->>>>>>> 890d149 (ONVIF Enhanced Camera Probing)
+def test_clockwise_grid_slot_mapping():
+    assert [grid_position_for_feed(index) for index in range(4)] == [
+        (0, 0),
+        (0, 1),
+        (1, 1),
+        (1, 0),
+    ]

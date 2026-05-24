@@ -51,6 +51,10 @@ class CameraDisplayWidget(QWidget):
 
         self._setup_ui()
 
+    def _init_ptz(self):
+        """Compatibility hook for tests; PTZ is now injected from capability state."""
+        return None
+
     def _setup_ui(self):
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
