@@ -2,8 +2,9 @@ from PyQt6.QtCore import QPointF, QRect, QSize, Qt
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QSizePolicy
 
-from arcane_eyes.core.constants import WIDTH, HEIGHT, STYLE_PTZ_BTN
+from arcane_eyes.core.constants import WIDTH, HEIGHT
 from arcane_eyes.core.exceptions import PTZError
+from arcane_eyes.ui.style.styles import STYLE_PTZ_BTN
 
 
 class VideoLabel(QLabel):
@@ -78,6 +79,10 @@ class CameraDisplayWidget(QWidget):
     def set_frame(self, pixmap: QPixmap):
         self.video_label.set_frame(pixmap)
         self._position_ptz_buttons()
+
+    def set_status(self, status_text: str):
+        if self.video_label._source_pixmap is None:
+            self.video_label.setText(status_text)
 
     def _create_overlay_buttons(self):
         button_size = 32

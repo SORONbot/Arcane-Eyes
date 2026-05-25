@@ -191,6 +191,7 @@ recordings/
 
 repomix-output.xml
 .eye_cache
+*.sqlite3
 .rag/
 .pytest_cache/
 .idea/
