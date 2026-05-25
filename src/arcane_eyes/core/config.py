@@ -6,7 +6,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # Storage Paths
 DEFAULT_SAVE_PATH = Path(os.getenv("SAVE_PATH", str(PROJECT_ROOT / "recordings")))
-CACHE_FILE_PATH = Path(os.getenv("CACHE_PATH", str(PROJECT_ROOT / ".eye_cache")))
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(PROJECT_ROOT / "arcane_eyes.sqlite3")))
 SETUP_QR_CREDENTIAL_CACHE_PATH = Path(
     os.getenv("SETUP_QR_CREDENTIAL_CACHE_PATH", str(PROJECT_ROOT / ".setup_qr_credentials"))
 )

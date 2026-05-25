@@ -14,6 +14,7 @@ dependencies = [
     "imutils==0.5.4",
     "opencv-python==4.12.0.88",
     "qrcode[pil]>=8.2",
+    "keyring>=25.0.0",
     "cryptography>=42.0.0",
     "pyqt6==6.10.1",
     "qdarkstyle==3.2.3",
