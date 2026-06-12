@@ -3,6 +3,7 @@ import random
 import string
 import time
 from dataclasses import dataclass, field
+from enum import StrEnum
 from ipaddress import ip_network
 from pathlib import Path
 from typing import Callable, Iterable, Set
@@ -38,13 +39,25 @@ class WifiCredentials:
     password: str = ""
 
 
+class ProvisioningProtocol(StrEnum):
+    GINATEX_QR = "ginatex_qr"
+    TAPO_LOCAL = "tapo_local"
+
+
+PROVISIONING_PROTOCOL_LABELS = {
+    ProvisioningProtocol.GINATEX_QR: "Ginatex QR",
+    ProvisioningProtocol.TAPO_LOCAL: "TP-Link Tapo C225",
+}
+
+
 @dataclass(frozen=True)
-class WifiProvisioningPayload:
+class GinatexWifiProvisioningPayload:
     ssid: str
     password: str = ""
     network_range: str = DEFAULT_SCAN_RANGE
     user_id: str = "-1"
     bind_token: str = field(default_factory=create_bind_token)
+    protocol: ProvisioningProtocol = ProvisioningProtocol.GINATEX_QR
 
     @property
     def encoded_password(self) -> str:
@@ -59,6 +72,112 @@ class WifiProvisioningPayload:
             self.encoded_password,
             self.user_id,
         ])
+
+
+WifiProvisioningPayload = GinatexWifiProvisioningPayload
+
+
+@dataclass(frozen=True)
+class TapoLocalProvisioningPayload:
+    ssid: str
+    password: str = ""
+    network_range: str = DEFAULT_SCAN_RANGE
+    model: str = "C225"
+    protocol: ProvisioningProtocol = ProvisioningProtocol.TAPO_LOCAL
+
+
+class ProvisioningError(RuntimeError):
+    pass
+
+
+class UnsupportedProvisioningError(ProvisioningError):
+    pass
+
+
+class GinatexQrProvisioningAdapter:
+    protocol = ProvisioningProtocol.GINATEX_QR
+    display_name = PROVISIONING_PROTOCOL_LABELS[protocol]
+
+    def create_payload(
+        self,
+        ssid: str,
+        password: str = "",
+        network_range: str = DEFAULT_SCAN_RANGE,
+    ) -> GinatexWifiProvisioningPayload:
+        return GinatexWifiProvisioningPayload(
+            ssid=ssid,
+            password=password,
+            network_range=normalize_network_range(network_range),
+        )
+
+    def qr_text(self, payload: GinatexWifiProvisioningPayload) -> str:
+        return payload.to_qr_text()
+
+
+class TapoLocalTransport:
+    def scan_ap_list(self) -> list[dict]:
+        raise UnsupportedProvisioningError("Tapo local transport is not implemented yet.")
+
+    def connect_ap(self, ssid: str, password: str) -> None:
+        raise UnsupportedProvisioningError("Tapo local transport is not implemented yet.")
+
+    def get_connect_status(self) -> str:
+        raise UnsupportedProvisioningError("Tapo local transport is not implemented yet.")
+
+
+class TapoLocalProvisioningAdapter:
+    protocol = ProvisioningProtocol.TAPO_LOCAL
+    display_name = PROVISIONING_PROTOCOL_LABELS[protocol]
+    supported_models = {"C225", "C225-2.0"}
+
+    def __init__(self, transport: TapoLocalTransport | None = None):
+        self.transport = transport
+
+    def create_payload(
+        self,
+        ssid: str,
+        password: str = "",
+        network_range: str = DEFAULT_SCAN_RANGE,
+        model: str = "C225",
+    ) -> TapoLocalProvisioningPayload:
+        if model not in self.supported_models:
+            supported = ", ".join(sorted(self.supported_models))
+            raise UnsupportedProvisioningError(f"Unsupported Tapo camera model '{model}'. Supported models: {supported}.")
+        return TapoLocalProvisioningPayload(
+            ssid=ssid,
+            password=password,
+            network_range=normalize_network_range(network_range),
+            model=model,
+        )
+
+    def qr_text(self, payload: TapoLocalProvisioningPayload) -> str | None:
+        return None
+
+    def start(self, payload: TapoLocalProvisioningPayload) -> None:
+        if self.transport is None:
+            raise UnsupportedProvisioningError(
+                "TP-Link Tapo local setup is separated from Ginatex QR provisioning, "
+                "but the Tapo TPAP/local transport has not been implemented yet."
+            )
+        self.transport.scan_ap_list()
+        self.transport.connect_ap(payload.ssid, payload.password)
+        self.transport.get_connect_status()
+
+
+def provisioning_protocol_options() -> list[tuple[ProvisioningProtocol, str]]:
+    return [
+        (ProvisioningProtocol.GINATEX_QR, PROVISIONING_PROTOCOL_LABELS[ProvisioningProtocol.GINATEX_QR]),
+        (ProvisioningProtocol.TAPO_LOCAL, PROVISIONING_PROTOCOL_LABELS[ProvisioningProtocol.TAPO_LOCAL]),
+    ]
+
+
+def provisioning_adapter_for(protocol: ProvisioningProtocol | str):
+    selected = ProvisioningProtocol(protocol)
+    if selected == ProvisioningProtocol.GINATEX_QR:
+        return GinatexQrProvisioningAdapter()
+    if selected == ProvisioningProtocol.TAPO_LOCAL:
+        return TapoLocalProvisioningAdapter()
+    raise UnsupportedProvisioningError(f"Unsupported provisioning protocol: {protocol}")
 
 
 class SetupQrCredentialCache:

@@ -38,7 +38,7 @@ from arcane_eyes.services.capability_service import CameraCapabilityEnrichmentSe
 from arcane_eyes.services.discovery_service import NetworkDiscoveryService
 from arcane_eyes.services.ptz_service import OnvifPTZService
 from arcane_eyes.services.provisioning_service import (
-    WifiProvisioningPayload,
+    GinatexQrProvisioningAdapter,
     normalize_network_range,
 )
 from arcane_eyes.services.recorder_service import PyAVRecorderService
@@ -759,7 +759,7 @@ class ArcaneEyesMainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
-        headers = ["Network Range", "SSID", "Password", "", ""]
+        headers = ["Network Range", "SSID", "Password", "", "", ""]
         for col, header in enumerate(headers):
             label = QLabel(header)
             label.setStyleSheet("font-weight: 700; color: #d7e1ea;")
@@ -782,14 +782,24 @@ class ArcaneEyesMainWindow(QMainWindow):
                 save_button.clicked.connect(
                     partial(self.save_network_profile, network_range, range_input, ssid_input, password_input)
                 )
-                qr_button = QPushButton("Generate QR")
-                qr_button.clicked.connect(partial(self.generate_network_qr, range_input, ssid_input, password_input))
+                setup_button = QPushButton("Generate Ginatex QR")
+                setup_button.clicked.connect(
+                    partial(
+                        self.generate_network_qr,
+                        range_input,
+                        ssid_input,
+                        password_input,
+                    )
+                )
+                delete_button = QPushButton("Delete")
+                delete_button.clicked.connect(partial(self.delete_network_profile, network_range))
 
                 grid.addWidget(range_input, row, 0)
                 grid.addWidget(ssid_input, row, 1)
                 grid.addWidget(password_input, row, 2)
                 grid.addWidget(save_button, row, 3)
-                grid.addWidget(qr_button, row, 4)
+                grid.addWidget(setup_button, row, 4)
+                grid.addWidget(delete_button, row, 5)
                 next_row = row + 1
 
         if self.show_new_network_row:
@@ -934,6 +944,21 @@ class ArcaneEyesMainWindow(QMainWindow):
         self.show_new_network_row = False
         self.show_settings_screen("Networks")
 
+    def delete_network_profile(self, network_range: str):
+        confirm = QMessageBox.question(
+            self,
+            "Delete Network",
+            f"Delete saved network {network_range} and its stored Wi-Fi credentials?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self.network_profile_repository.delete(network_range)
+        self.credentials_store.delete_wifi_credentials(network_range)
+        self.show_network_settings()
+
     def generate_network_qr(
         self,
         range_input: QLineEdit,
@@ -951,20 +976,29 @@ class ArcaneEyesMainWindow(QMainWindow):
             QMessageBox.warning(self, "SSID Required", "Enter the Wi-Fi network name.")
             return
 
-        payload = WifiProvisioningPayload(
+        adapter = GinatexQrProvisioningAdapter()
+        payload = adapter.create_payload(
             ssid=ssid,
             password=password_input.text(),
             network_range=network_range,
         )
-        self.show_network_qr_dialog(network_range, self._make_qr_pixmap(payload.to_qr_text(), 320))
+        self.show_network_qr_dialog(
+            network_range,
+            self._make_qr_pixmap(adapter.qr_text(payload), 320),
+            protocol_label=adapter.display_name,
+        )
 
-    def show_network_qr_dialog(self, network_range: str, pixmap: QPixmap):
+    def show_network_qr_dialog(self, network_range: str, pixmap: QPixmap, protocol_label: str = "Ginatex QR"):
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Setup QR - {network_range}")
+        dialog.setWindowTitle(f"{protocol_label} Setup - {network_range}")
         dialog.setModal(True)
         dialog.setMinimumWidth(380)
 
         layout = QVBoxLayout(dialog)
+        title = QLabel(f"{protocol_label} provisioning")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
         qr_label = QLabel()
         qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         qr_label.setPixmap(pixmap)

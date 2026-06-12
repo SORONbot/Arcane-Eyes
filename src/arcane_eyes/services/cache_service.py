@@ -13,6 +13,12 @@ class CameraCacheEntry:
     display_name: str
     username: str = ""
     password: str = ""
+    vendor: str = ""
+    model: str = ""
+    setup_method: str = ""
+    mac_address: str = ""
+    hardware_version: str = ""
+    device_identifier: str = ""
     capability: CameraCapability = field(default_factory=CameraCapability)
     selected_preview_profile: str = ""
     selected_detail_profile: str = ""

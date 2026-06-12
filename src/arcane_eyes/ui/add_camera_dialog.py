@@ -10,15 +10,19 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QComboBox,
     QVBoxLayout,
 )
 import qrcode
 
 from arcane_eyes.core.config import DEFAULT_SCAN_RANGE
 from arcane_eyes.services.provisioning_service import (
+    ProvisioningProtocol,
     SetupQrCredentialCache,
-    WifiProvisioningPayload,
+    UnsupportedProvisioningError,
     normalize_network_range,
+    provisioning_adapter_for,
+    provisioning_protocol_options,
 )
 
 
@@ -41,6 +45,11 @@ class AddCameraDialog(QDialog):
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
+        self.protocol_selector = QComboBox()
+        for protocol, label in provisioning_protocol_options():
+            self.protocol_selector.addItem(label, protocol.value)
+        self.protocol_selector.currentIndexChanged.connect(self._on_protocol_changed)
+
         self.network_range_input = QLineEdit(DEFAULT_SCAN_RANGE)
         self.network_range_input.setPlaceholderText("192.168.100.0/24")
         self.network_range_input.editingFinished.connect(self._load_cached_credentials)
@@ -51,14 +60,16 @@ class AddCameraDialog(QDialog):
         self.password_input.setPlaceholderText("Leave empty for open networks")
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
 
+        form.addRow("Camera type", self.protocol_selector)
         form.addRow("Network range", self.network_range_input)
         form.addRow("SSID", self.ssid_input)
         form.addRow("Password", self.password_input)
         layout.addLayout(form)
 
-        self.qr_label = QLabel("Enter Wi-Fi credentials to generate setup QR.")
+        self.qr_label = QLabel("Select a camera type and enter Wi-Fi credentials.")
         self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.qr_label.setFixedSize(360, 360)
+        self.qr_label.setWordWrap(True)
         layout.addWidget(self.qr_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.status_label = QLabel(self._initial_status_text())
@@ -67,7 +78,7 @@ class AddCameraDialog(QDialog):
         layout.addWidget(self.status_label)
 
         button_row = QHBoxLayout()
-        self.start_button = QPushButton("Generate QR & Start")
+        self.start_button = QPushButton("Generate Ginatex QR & Start")
         self.retry_button = QPushButton("Retry Scan")
         self.cancel_button = QPushButton("Cancel")
 
@@ -80,6 +91,7 @@ class AddCameraDialog(QDialog):
         button_row.addWidget(self.retry_button)
         button_row.addWidget(self.cancel_button)
         layout.addLayout(button_row)
+        self._on_protocol_changed()
 
     def _initial_status_text(self) -> str:
         status = f"Waiting to scan {DEFAULT_SCAN_RANGE}."
@@ -117,12 +129,23 @@ class AddCameraDialog(QDialog):
             return
 
         password = self.password_input.text()
-        self.payload = WifiProvisioningPayload(
-            ssid=ssid,
-            password=password,
-            network_range=network_range,
-        )
-        self._show_qr(self.payload.to_qr_text())
+        protocol = self._selected_protocol()
+        adapter = provisioning_adapter_for(protocol)
+        try:
+            self.payload = adapter.create_payload(
+                ssid=ssid,
+                password=password,
+                network_range=network_range,
+            )
+        except UnsupportedProvisioningError as exc:
+            QMessageBox.warning(self, "Unsupported Camera", str(exc))
+            return
+
+        qr_text = adapter.qr_text(self.payload)
+        if qr_text:
+            self._show_qr(qr_text)
+        else:
+            self._show_no_qr_message()
         self._save_cached_credentials(network_range, ssid, password)
         self.set_scanning_state()
         self.provisioning_started.emit(self.payload)
@@ -157,28 +180,56 @@ class AddCameraDialog(QDialog):
             )
         )
 
+    def _show_no_qr_message(self):
+        self.qr_label.setPixmap(QPixmap())
+        self.qr_label.setText(
+            "TP-Link Tapo setup uses local discovery and TPAP provisioning, not the Ginatex QR payload."
+        )
+
+    def _selected_protocol(self) -> ProvisioningProtocol:
+        return ProvisioningProtocol(self.protocol_selector.currentData())
+
+    def _on_protocol_changed(self):
+        if self._selected_protocol() == ProvisioningProtocol.GINATEX_QR:
+            self.start_button.setText("Generate Ginatex QR & Start")
+            self.qr_label.setText("Enter Wi-Fi credentials to generate the Ginatex setup QR.")
+            self.retry_button.setText("Retry Scan")
+        else:
+            self.start_button.setText("Start Tapo Local Setup")
+            self.qr_label.setText("Enter Wi-Fi credentials to start TP-Link Tapo local setup.")
+            self.retry_button.setText("Retry Setup")
+
     def _on_cancel_clicked(self):
         self.cancelled.emit()
         self.reject()
 
     def set_scanning_state(self):
+        self.protocol_selector.setEnabled(False)
         self.network_range_input.setEnabled(False)
         self.ssid_input.setEnabled(False)
         self.password_input.setEnabled(False)
         self.start_button.setEnabled(False)
         self.retry_button.setEnabled(False)
         network_range = self.payload.network_range if self.payload else self.network_range_input.text().strip()
-        status = f"Show this QR to the reset camera. Scanning {network_range} for RTSP stream..."
+        if self.payload and self.payload.protocol == ProvisioningProtocol.TAPO_LOCAL:
+            status = f"Starting TP-Link Tapo local setup on {network_range}..."
+        else:
+            status = f"Show this Ginatex QR to the reset camera. Scanning {network_range} for RTSP stream..."
         if self.credential_cache.warning:
             status = f"{status} {self.credential_cache.warning}"
         self.status_label.setText(status)
 
     def set_progress(self, remaining_seconds: int):
         network_range = self.payload.network_range if self.payload else self.network_range_input.text().strip()
-        self.status_label.setText(
-            f"Show this QR to the camera. Scanning {network_range} for a new RTSP stream... "
-            f"{remaining_seconds}s left."
-        )
+        if self.payload and self.payload.protocol == ProvisioningProtocol.TAPO_LOCAL:
+            self.status_label.setText(
+                f"Waiting for TP-Link Tapo setup on {network_range}... {remaining_seconds}s left."
+            )
+        else:
+            self.status_label.setText(
+                f"Show this Ginatex QR to the camera. Scanning {network_range} for a new RTSP stream... "
+                f"{remaining_seconds}s left."
+            )
 
     def set_success(self, ip: str):
         self.status_label.setText(f"Camera adopted at {ip}.")
@@ -186,7 +237,10 @@ class AddCameraDialog(QDialog):
         self.cancel_button.setText("Close")
 
     def set_timeout(self):
-        self.status_label.setText("No new RTSP stream found. Keep the QR visible and retry scanning.")
+        if self.payload and self.payload.protocol == ProvisioningProtocol.TAPO_LOCAL:
+            self.status_label.setText("TP-Link Tapo setup did not complete. Check setup mode and retry.")
+        else:
+            self.status_label.setText("No new RTSP stream found. Keep the Ginatex QR visible and retry scanning.")
         self.retry_button.setEnabled(True)
         self.start_button.setEnabled(False)
 

@@ -40,6 +40,12 @@ class AppStore:
                 ip TEXT NOT NULL UNIQUE,
                 display_name TEXT NOT NULL,
                 username TEXT NOT NULL DEFAULT '',
+                vendor TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                setup_method TEXT NOT NULL DEFAULT '',
+                mac_address TEXT NOT NULL DEFAULT '',
+                hardware_version TEXT NOT NULL DEFAULT '',
+                device_identifier TEXT NOT NULL DEFAULT '',
                 capability_json TEXT NOT NULL DEFAULT '',
                 selected_preview_profile TEXT NOT NULL DEFAULT '',
                 selected_detail_profile TEXT NOT NULL DEFAULT '',
@@ -60,7 +66,25 @@ class AppStore:
             "INSERT OR REPLACE INTO app_metadata(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
+        self._ensure_camera_metadata_columns()
         self.connection.commit()
+
+    def _ensure_camera_metadata_columns(self) -> None:
+        existing = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(cameras)").fetchall()
+        }
+        metadata_columns = {
+            "vendor": "TEXT NOT NULL DEFAULT ''",
+            "model": "TEXT NOT NULL DEFAULT ''",
+            "setup_method": "TEXT NOT NULL DEFAULT ''",
+            "mac_address": "TEXT NOT NULL DEFAULT ''",
+            "hardware_version": "TEXT NOT NULL DEFAULT ''",
+            "device_identifier": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in metadata_columns.items():
+            if column not in existing:
+                self.connection.execute(f"ALTER TABLE cameras ADD COLUMN {column} {definition}")
 
     def camera_repository(self) -> "CameraRepository":
         return CameraRepository(self.connection, self.credentials_store)
@@ -85,15 +109,22 @@ class CameraRepository:
         self.connection.execute(
             """
             INSERT INTO cameras (
-                id, ip, display_name, username, capability_json,
+                id, ip, display_name, username, vendor, model, setup_method,
+                mac_address, hardware_version, device_identifier, capability_json,
                 selected_preview_profile, selected_detail_profile,
                 cache_version, updated_at, credentials_missing
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ip) DO UPDATE SET
                 id = excluded.id,
                 display_name = excluded.display_name,
                 username = excluded.username,
+                vendor = excluded.vendor,
+                model = excluded.model,
+                setup_method = excluded.setup_method,
+                mac_address = excluded.mac_address,
+                hardware_version = excluded.hardware_version,
+                device_identifier = excluded.device_identifier,
                 capability_json = excluded.capability_json,
                 selected_preview_profile = excluded.selected_preview_profile,
                 selected_detail_profile = excluded.selected_detail_profile,
@@ -106,6 +137,12 @@ class CameraRepository:
                 entry.ip,
                 entry.display_name,
                 entry.username,
+                entry.vendor,
+                entry.model,
+                entry.setup_method,
+                entry.mac_address,
+                entry.hardware_version,
+                entry.device_identifier,
                 json.dumps(entry.capability.to_dict(), separators=(",", ":"), sort_keys=True),
                 entry.selected_preview_profile,
                 entry.selected_detail_profile,
@@ -180,6 +217,12 @@ class CameraRepository:
             display_name=row["display_name"],
             username=username,
             password=password,
+            vendor=row["vendor"] or "",
+            model=row["model"] or "",
+            setup_method=row["setup_method"] or "",
+            mac_address=row["mac_address"] or "",
+            hardware_version=row["hardware_version"] or "",
+            device_identifier=row["device_identifier"] or "",
             capability=capability,
             selected_preview_profile=row["selected_preview_profile"] or "",
             selected_detail_profile=row["selected_detail_profile"] or "",
@@ -194,6 +237,10 @@ class NetworkProfileRepository:
 
     def list(self) -> list[dict]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM network_profiles ORDER BY network_range")]
+
+    def delete(self, network_range: str) -> None:
+        self.connection.execute("DELETE FROM network_profiles WHERE network_range = ?", (network_range,))
+        self.connection.commit()
 
     def update(self, network_range: str, ssid: str, credentials_missing: bool = False) -> None:
         self.connection.execute(
